@@ -915,6 +915,44 @@ bool RunDecompression(const std::string& input_path,
 
 namespace ppmd_page { extern int hilfs; }
 #ifdef CMIX_SAMPLE
+// One float16 PPMd row after each input byte, in the neural head's order.
+static int SamplePriors(const char* path, const char* output) {
+  FILE* input = fopen(path, "rb");
+  if (!input) { perror(path); return 1; }
+  FILE* sink = fopen(output, "wbx");
+  if (!sink) { perror(output); fclose(input); return 1; }
+  ppmd_page::hilfs = 1;
+  std::vector<bool> vocab(256);
+  vocab_frozen::FillVocab(&vocab);
+  unsigned byte = 0;
+  PPMD::PPMD ppmd(25, 14000, byte, vocab);
+  bool ok = true;
+  for (int c; (c = getc(input)) != EOF;) {
+    if (!vocab[c]) {
+      fprintf(stderr, "input outside frozen alphabet\n");
+      ok = false;
+      break;
+    }
+    byte = c;
+    ppmd.ByteUpdate();
+    float row[208];
+    uint16_t halves[208];
+    for (int i = 0; i < 256; ++i)
+      if (vocab[i]) row[transformer::g_b2i[i]] = ppmd.BytePredict()[i];
+    transformer::FloatsToHalves(row, halves, 208);
+    if (fwrite(halves, sizeof(halves), 1, sink) != 1) {
+      perror(output);
+      ok = false;
+      break;
+    }
+  }
+  if (ferror(input)) { perror(path); ok = false; }
+  fclose(input);
+  if (fclose(sink) != 0) { perror(output); ok = false; }
+  if (!ok) remove(output);
+  return ok ? 0 : 1;
+}
+
 // Feed the actual PPMd and match channels without starting an arithmetic coder.
 static int SampleScore(const char* reference) {
   transformer::sample_body_stream = true;
@@ -1002,6 +1040,7 @@ static int SampleRoundTrip(bool verify, const char* reference, const char* paylo
 #endif
 int main(int argc, char** argv) {
 #ifdef CMIX_SAMPLE
+  if (argc == 4 && !strcmp(argv[1], "--sample-priors")) return SamplePriors(argv[2], argv[3]);
   if (argc == 3 && !strcmp(argv[1], "--sample-score")) return SampleScore(argv[2]);
   if (argc == 4 && (!strcmp(argv[1], "--sample-write") || !strcmp(argv[1], "--sample-verify")))
     return SampleRoundTrip(!strcmp(argv[1], "--sample-verify"), argv[2], argv[3]);

@@ -1,5 +1,7 @@
 # `training/`: how the pre-trained parts of this entry were produced
 
+For this fork's Recursive Refiner, see the [standalone training and CLI guide](refiner/README.md). The original model's MIT license accompanies the vendored blocks in [refiner/LICENSE-cramming.txt](refiner/LICENSE-cramming.txt). The sections below document the upstream transformer and BITLSTM.
+
 This directory is **documentation and tooling, not part of the entry**.
 `build.sh` never enters it; nothing here is compiled into `archive9` or into the
 decompressor. It serves reproducibility and attribution.

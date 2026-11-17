@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 int main(int argc, char** argv) {
   if (argc != 3) {
@@ -12,15 +13,20 @@ int main(int argc, char** argv) {
   rr::Model model(argv[1]);
   FILE* file = std::fopen(argv[2], "rb");
   if (!file) { std::perror(argv[2]); return 1; }
+  char header[4];
+  bool priors = std::fread(header, 1, 4, file) == 4 && std::memcmp(header, "RRP2", 4) == 0;
+  if (!priors) std::rewind(file);
+  if (model.uses_prior() != priors) { std::fprintf(stderr, "wrong parity fixture format\n"); return 1; }
   float max_prob = 0, max_state = 0;
   int rows = 0;
   for (int token; (token = std::fgetc(file)) != EOF; ++rows) {
     int reset = std::fgetc(file), read = std::fgetc(file);
-    float expected[208 + 2*192], prob[208];
+    float expected[208 + 2*192], prob[208], prior[208];
     if (reset < 0 || reset > 1 || read < 0 || read > 1 ||
+        (priors && std::fread(prior, sizeof(float), 208, file) != 208) ||
         std::fread(expected, sizeof(float), 592, file) != 592) return 1;
     if (reset) model.begin_article();
-    model.step(token, prob, read);
+    model.step(token, prob, read, priors ? prior : nullptr);
     for (int i = read ? 0 : 208; i < 592; ++i) {
       float actual = i < 208 ? prob[i] :
           i < 400 ? model.last_hidden()[i-208] : model.last_key()[i-400];

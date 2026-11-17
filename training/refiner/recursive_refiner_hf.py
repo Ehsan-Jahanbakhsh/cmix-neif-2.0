@@ -248,6 +248,7 @@ class SelfAttention(nn.Module):
         self.rope = rope
         self.is_causal = bool(is_causal)
         self.use_sdpa = bool(use_sdpa)
+        self.window_size = None
 
         self.q_proj = nn.Linear(dim, dim, bias=True)
         self.k_proj = nn.Linear(dim, dim, bias=True)
@@ -261,15 +262,18 @@ class SelfAttention(nn.Module):
         seq_len: int,
         device: torch.device,
     ) -> Optional[torch.Tensor]:
-        if attention_mask is None:
+        if attention_mask is None and self.window_size is None:
             return None
 
         # SDPA bool masks use True for positions that are allowed to attend.
-        mask = attention_mask.to(dtype=torch.bool, device=device).view(batch_size, 1, 1, seq_len)
+        mask = None if attention_mask is None else attention_mask.to(
+            dtype=torch.bool, device=device).view(batch_size, 1, 1, seq_len)
 
         if self.is_causal:
             causal = torch.ones((seq_len, seq_len), device=device, dtype=torch.bool).tril().view(1, 1, seq_len, seq_len)
-            mask = mask & causal
+            if self.window_size is not None:
+                causal = causal.triu(1 - self.window_size)
+            mask = causal if mask is None else mask & causal
 
         return mask
 
@@ -283,13 +287,11 @@ class SelfAttention(nn.Module):
         b, _, t, _ = q.shape
         att = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # [B, H, T, T]
 
-        if self.is_causal:
-            causal = torch.tril(torch.ones((t, t), device=att.device, dtype=torch.bool))
-            att = att.masked_fill(~causal.view(1, 1, t, t), torch.finfo(att.dtype).min)
-
-        if attention_mask is not None:
-            key_mask = attention_mask.to(dtype=torch.bool, device=att.device).view(b, 1, 1, t)
-            att = att.masked_fill(~key_mask, torch.finfo(att.dtype).min)
+        mask = self._build_sdpa_mask(attention_mask, b, t, att.device)
+        if mask is None and self.is_causal:
+            mask = torch.ones((t, t), device=att.device, dtype=torch.bool).tril()
+        if mask is not None:
+            att = att.masked_fill(~mask, torch.finfo(att.dtype).min)
 
         att = F.softmax(att, dim=-1)
         return torch.matmul(att, v)  # [B, H, T, Hd]

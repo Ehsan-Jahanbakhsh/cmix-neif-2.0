@@ -1,70 +1,121 @@
 # Recursive Refiner in cmix
 
-The matched preset uses two shared blocks of width 512 with eight heads, a SwiGLU width of 2,298, two high cycles and three low updates per high cycle. That gives 9,284,584 trainable parameters, 1,012 fewer than the upstream transformer. Reusing the blocks gives 16 block evaluations per input token. [Original Recursive Refiner implementation](https://github.com/Ehsan-Jahanbakhsh/cramming-me/blob/15766a659deced4c18be5cc2625cbad3ebd56ae5/cramming/architectures/recursive_refiner_hf.py)
+You can train, export and score the byte predictor before running any compression. The refiner learns to predict the next byte from preceding tokens and cmix's PPMd distribution. The C++ implementation uses the exported weights for both encoding and decoding. [Python blocks](recursive_refiner_hf.py) · [Trainer](train.py) · [C++ inference](../../src/refiner/refiner.cpp)
 
-## Train a checkpoint and compile
+## Build the CLI tools
 
-Run these commands from the fork root in Ubuntu 24.04 on x86-64 with AVX2 and F16C. Ubuntu under WSL2 works. Use a Linux filesystem for the compression working directory. The Python model is vendored with its MIT license. C++ inference has no PyTorch dependency.
+Run these commands from the fork root in Ubuntu 24.04 on an x86-64 CPU with AVX2 and F16C. Ubuntu under WSL2 works. Use a Linux filesystem for cmix's scratch files.
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y clang-18 lld-18 make g++ python3-venv
-python3 -m venv build-refiner/venv
-source build-refiner/venv/bin/activate
-python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-python -m pip install 'transformers>=4.45,<5' numpy
-python training/refiner/train.py --preset matched --steps 64 \
-  --out build-refiner/recursive-refiner.rrb --parity build-refiner/parity.bin \
-  --sample build-refiner/heldout.bin
-
+mkdir -p build-refiner
 make -j4 CC=clang++-18 BYTE_MODEL=refiner SAMPLE=1 cmix
 cp cmix build-refiner/cmix-refiner
 make -j4 CC=clang++-18 BYTE_MODEL=transformer SAMPLE=1 cmix
 cp cmix build-refiner/cmix-transformer
 cp weights-poc8m_w2048_tf2t3_pruned_v5k_np2.c5 build-refiner/
-
 clang++-18 -std=c++17 -O3 -march=x86-64-v3 -ffp-model=precise -ffp-contract=off \
-  training/refiner/check.cpp src/refiner/refiner.cpp src/detmath.cpp -o build-refiner/refiner-check
-build-refiner/refiner-check build-refiner/recursive-refiner.rrb build-refiner/parity.bin
+  -ffunction-sections -fdata-sections -Wl,--gc-sections training/refiner/check.cpp \
+  src/refiner/refiner.cpp src/tf1/opt/glue.cpp src/detmath.cpp -o build-refiner/refiner-check
 ```
 
-The demonstration uses upstream’s 50 KB profiling text, lowercases it, maps the frozen byte alphabet, and reserves the final 10% before drawing training windows. It uses seed 1 and a 32-position context. On the development run, 64 AdamW steps saw 4,096 training targets. Negative log likelihood fell from 12.46 to 5.46 bits per byte on a fixed sample of 512 validation targets. The 40-row C++ parity check covered prompt tokens, omitted readouts, a document reset and a context reset. Maximum probability error was 5.1 × 10⁻⁷.
+## Train the refiner separately
 
-## Compare compression
+The first command below the install steps prepares the bundled profiling text. It lowercases the bytes, filters to cmix's frozen alphabet, reserves the final 10% for validation and runs PPMd independently on each split. Each retained byte takes 416 bytes of prior data on disk. For a small text corpus of your own, append `--input my-text.txt` to the preparation command. Once the priors exist, the trainer runs independently of cmix.
+
+```bash
+python3 -m venv build-refiner/venv
+source build-refiner/venv/bin/activate
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+python -m pip install 'transformers>=4.45,<5' numpy
+
+python training/refiner/prepare_demo.py build-refiner/cmix-refiner build-refiner/demo
+python training/refiner/train.py --preset matched --steps 128 --qat-steps 32 \
+  --context 128 --window 64 --threads 6 --demo-dir build-refiner/demo \
+  --out build-refiner/recursive-refiner.rrb --parity build-refiner/parity.bin \
+  --sample build-refiner/heldout.bin
+build-refiner/refiner-check build-refiner/recursive-refiner.rrb build-refiner/parity.bin
+python training/refiner/benchmark.py build-refiner --score-only
+```
+
+The fork includes the trained demo checkpoint as `recursive-refiner.rrb` at the repository root. To score those weights directly after compiling, copy this file and `build-refiner/demo/heldout.bin` into `build-refiner/` after the preparation command.
+
+`--blocks` controls the number of distinct blocks in the shared stack. `--hi-cycles` and `--lo-cycles` control how many times the same weights are used. Changing just the cycles preserves the parameter budget and changes the compute per token. `--ffn-width` changes the SwiGLU width and the parameter count. `--context` sets the training crop length and `--window` sets the attention window for training and inference. Each crop uses up to half its length for left context, capped at the window length. The trainer excludes those warmup tokens from the loss.
+
+The matched preset has width 512, eight heads, two shared blocks, FFN width 2,298, two high cycles and three low updates per high cycle. This gives 16 block evaluations per token and **9,285,096 trainable parameters**, 500 fewer than the upstream transformer. Each pass keeps a separate rolling KV history until a document reset. The first 192 high-state and low-state features feed cmix's existing BITLSTM and semantic cache. The byte head ties the embedding to the output projection and learns a gate on the PPMd log probabilities. The upstream transformer also has learned match features and an online second head. [Original Recursive Refiner](https://github.com/Ehsan-Jahanbakhsh/cramming-me/blob/15766a659deced4c18be5cc2625cbad3ebd56ae5/cramming/architectures/recursive_refiner_hf.py)
+
+Training ends with simulated per-row 4-bit weights. The exporter packs two weights per byte for the embeddings and linear layers, with FP32 row scales. C++ expands the codes to signed bytes on load and accumulates in FP32. The matched 64-token-window checkpoint occupies **4,796,096 bytes**. Upstream's mixed-precision container occupies **3,744,629 bytes**.
+
+## Results from the included training recipe
+
+The CPU demo saw 16,384 scored training targets across 128 AdamW steps. Loss fell from 5.2502 to 2.0288 bits per scored byte over a fixed validation sample of 1,024 targets. On 200 streaming parity rows, including prompt tokens, skipped readouts, multiple window wraps and a document reset, the largest C++ versus PyTorch probability difference was 0.000000194.
+
+On the same 4,096-byte held-out body excerpt, starting from a fresh predictor for each model, the C++ prediction-only CLI gave the following results over 4,095 next-byte predictions.
+
+| Model | Bits per scored byte |
+|---|---:|
+| Shipped transformer | 2.079623 |
+| Demo Q4 refiner | 2.517783 |
+
+The shipped model leads on this excerpt. It received the full upstream training schedule. For an architecture comparison, match the train/validation documents, scored training targets, side inputs and evaluation procedure. Report parameter count, weight bytes and compute separately. The score CLI measures the neural byte head. The sample round-trip CLI below measures the full mixer's payload.
+
+## Train on the full compressor data
+
+Both trainers can use a completed upstream stage-(c) package. Use the directory containing `zeilen.dump`, `doc-rows.int64`, `doc-last-ziel.int32`, `ppmd-bytes.uint8`, `ppmd-probs.float16` and `z3-prior0.float16`. Upstream's package builder assembles these together in its final `pkg_check` directory. The refiner memory-maps the prior matrix, uses the upstream prompt, target and mask rules, and holds out the last 10% of documents. The full prior matrix alone occupies about 203 GB. To generate it, use the unmodified upstream commit `35d1957a` as the package builder's `ENTRY`. [Package instructions and hardware requirements](../README.md) · [Package builder](../tf/2_package/build_package.sh)
+
+```bash
+# One-time data preparation if you need to generate the package
+git worktree add --detach ../cmix-stage-c 35d1957a5074db802fc134126afc77b76d931761
+entry=$(cd ../cmix-stage-c && pwd)
+ENTRY="$entry" ENWIK9="/absolute/path/to/enwik9" DICT="$entry/dictionary/english.dic" \
+  ORDER="$entry/src/readalike_prepr/data/new_article_order" WORK="$HOME/cmix-training-data" \
+  bash "$entry/training/tf/2_package/build_package.sh"
+```
+
+```bash
+# From the fork root, with CUDA-enabled PyTorch and the completed package
+python training/refiner/train.py --package /path/to/pkg_check --preset matched \
+  --device cuda --context 512 --window 256 --batch 4 --steps 10000 --qat-steps 2500 \
+  --out build-refiner/full/recursive-refiner.rrb
+```
+
+### Train the original transformer separately
+
+The original transformer's standalone trainer and export tools are included. Prepare its Python/CUDA environment as described in the upstream training guide. Set `TFT_TREE` to the assembled upstream training tree, `PKG` to the full package above, and place the upstream beehive start weights in `$W/start/beehive.c4`. The staged script checks their SHA-256. The original training used multiple GPUs. [Environment and start weights](../README.md) · [Transformer trainer and stages](../tf/3_train/README.md)
+
+```bash
+export TFT_TREE="$HOME/cmix-transformer-tree"
+export PKG="/path/to/pkg_check"
+export W="$HOME/cmix-transformer-training"
+cp -a training/tf/tree_upstream "$TFT_TREE"  # use a new destination
+cp -a training/tf/tree_overlay/. "$TFT_TREE/"
+python3 training/tf/2_package/patch_paket11.py "$TFT_TREE"
+mkdir -p "$W/start"
+cp /path/to/weights-poc8m_w2048_p15f_v3bf16_gestrichen_v4.c4 "$W/start/beehive.c4"
+# Use the upstream training environment at $TFT_TREE/.venv, or set PY to its Python.
+NGPU=8 bash training/tf/3_train/reproduce.sh
+python3 training/tf/3_train/export/np2/np2_container.py np \
+  "$W/t3/export/v5.c5" "$W/weights-poc8m_w2048_tf2t3_pruned_v5k_np2.c5" k fw np2 dead
+```
+
+## Run compression
+
+For a short encode/decode comparison, run the command below yourself. It encodes the held-out sample with both models and verifies every decoded byte in a fresh process. Use `--model refiner` for just the refiner or `--sample PATH` for another excerpt in the frozen alphabet.
 
 ```bash
 python3 training/refiner/benchmark.py build-refiner
 ```
 
-The script encodes the same 4 KiB held-out excerpt with each full mixer and verifies every decoded byte in a fresh process. It reports payload bytes, bits per input byte, encoding time and checkpoint size. Each run gets a separate temporary working directory for cmix’s scratch files. Use `--sample PATH` for another body excerpt in the frozen byte alphabet.
-
-The sample harness feeds body bytes directly into both engines with the real PPMd and match channels available. The enwik9 run also applies the upstream text transforms, metadata gating and prompt insertion. A prediction-only pass over the 4 KiB fixture measured **5.699 bits per scored byte for the refiner** and **2.080 for the shipped transformer**, over the same 4,095 predictions. These are byte-model log losses. The refiner had 64 demonstration training steps and the transformer had its full upstream training.
-
-## Train on the compressor’s data
-
-Generate the upstream stage (c) training package with a clean checkout of upstream commit `35d1957`. The refiner loader reads `zeilen.dump`, `doc-rows.int64`, `doc-last-ziel.int32` and `ppmd-bytes.uint8`. It uses upstream’s target and mask logic, scores only eligible rows, includes inserted prompt tokens as context and holds out the last 10% of documents. The large prior matrix is optional for refiner training. [Upstream training package instructions](https://github.com/marwoelk/cmix-neif-2.0/blob/35d1957a5074db802fc134126afc77b76d931761/training/README.md)
+For enwik9, build a packaged executable in a Linux working directory containing the original file named `enwik9`. Running `comp9` produces `archive9`. The total submission size is the size of both files combined.
 
 ```bash
-python training/refiner/train.py --package /path/to/package --preset matched \
-  --device cuda --context 256 --batch 4 --steps 10000 \
-  --out build-refiner/recursive-refiner.rrb
-```
-
-Use a CUDA-enabled PyTorch installation for that example. Set the context, batch size and training budget to suit the machine. For an architecture comparison, train both models on the same document split and number of scored targets, then compare held-out loss, actual payload, wall time and stored weight bytes. The shipped baseline also uses learned side-channel projections and an online fast-weight head.
-
-## Run on enwik9
-
-The full build embeds the checkpoint, dictionary hints and article order into `comp9`. Use the packaged executable for enwik9. The plain `make cmix` binary above is for the sample harness.
-
-```bash
-# From the fork root, prepare the Linux release toolchain and build.
+# Start in the fork root
 bash install.sh
 repo=$(pwd)
 mkdir -p ~/cmix-refiner-run
 cd ~/cmix-refiner-run
-BYTE_MODEL=refiner REFINER_WEIGHTS="$repo/build-refiner/recursive-refiner.rrb" bash "$repo/build.sh"
-
-# Place the original 1,000,000,000-byte file named enwik9 in this directory.
+BYTE_MODEL=refiner bash "$repo/build.sh"
 ./comp9
 chmod +x archive9
 ./archive9
@@ -72,8 +123,9 @@ cmp enwik9 enwik9_uncompressed
 wc -c comp9 archive9
 ```
 
-The score sums the sizes of the compressor and self-extracting archive. Each contains the weights. The matched demonstration stores 37,146,560 bytes of FP32 weights and rotary tables per copy. The shipped transformer’s quantized container is 3,744,629 bytes. This build exercises the model swap and still needs quantization and representative training to compete on total archive size. Compare with the upstream executable in a separate run directory.
+This build uses the included demonstration checkpoint. To embed your own checkpoint at build time, set `REFINER_WEIGHTS` to its absolute path. Once you have a packaged Q4 refiner executable, you can install another exported checkpoint in a **new** executable. This copies the compiled code, dictionary hints and article order, and updates the embedded weights and size trailer. The checkpoint specifies the window size, block count and cycle counts at load time.
 
-## Interface to cmix
-
-The input embedding has 216 rows for 208 byte IDs and eight prompt IDs. The output applies the first 208 rows as a tied byte head. Every high/low pass has its own causal KV history. The Python loader and C++ engine both reset at context-block boundaries, and the engine also respects upstream document resets. The first 192 high-state components feed BITLSTM and the first 192 low-state components feed the semantic cache. The refiner’s single head leaves the transformer-specific online second-head slot off during live rows. The original BITLSTM weights are retained. [Streaming implementation](../../src/refiner/refiner.cpp)
+```bash
+python3 "$repo/training/refiner/replace_weights.py" ./comp9 \
+  "$repo/build-refiner/full/recursive-refiner.rrb" ~/cmix-next-run/comp9
+```

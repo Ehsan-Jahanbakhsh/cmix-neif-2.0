@@ -75,9 +75,9 @@ CPPFLAGS_PART-THAT-IS-COLD += -DCMIX_REFINER
 CPPFLAGS_PART-THAT-CAN-BE-SLOW += -DCMIX_REFINER
 CPPFLAGS_PART-THAT-SHOULD-BE-FAST += -DCMIX_REFINER
 TF1_CXXFLAGS += -DCMIX_REFINER
-TF1_SRCS := src/tf1/tf1_engine.cpp src/refiner/refiner.cpp src/tf1/tf1_z3.cpp src/tf1/tf1_prompt.cpp src/tf1/tf1_gate.cpp
+TF1_SRCS := src/tf1/tf1_engine.cpp src/refiner/refiner.cpp src/tf1/opt/glue.cpp src/tf1/tf1_z3.cpp src/tf1/tf1_prompt.cpp src/tf1/tf1_gate.cpp
 TF1_SRCS_OZ := src/tf1/tf1_z3.cpp src/tf1/tf1_prompt.cpp src/tf1/tf1_gate.cpp
-TF1_OBJ := tf1_engine.o refiner.o tf1_z3.o tf1_prompt.o tf1_gate.o
+TF1_OBJ := tf1_engine.o refiner.o glue.o tf1_z3.o tf1_prompt.o tf1_gate.o
 else ifneq ($(BYTE_MODEL),transformer)
 $(error BYTE_MODEL must be transformer or refiner)
 endif

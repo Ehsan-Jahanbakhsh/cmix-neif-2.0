@@ -326,7 +326,9 @@ struct Tf1Engine::Impl {
             , bool gelesen
            ) {
 #ifdef CMIX_REFINER
-    opt->step(tok, out, gelesen);
+    float prior_f32[208];
+    if (gelesen && opt->uses_prior()) RowToFloats(prior, prior_f32);
+    opt->step(tok, out, gelesen, prior_f32);
 #else
     if (opt) opt->set_gelesen(gelesen);
     fx2::PaketChannels ch;
