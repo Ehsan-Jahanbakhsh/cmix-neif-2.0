@@ -62,16 +62,39 @@ The shipped model leads on this excerpt. It received the full upstream training 
 
 ## Train on the full compressor data
 
-Both trainers can use a completed upstream stage-(c) package. Use the directory containing `zeilen.dump`, `doc-rows.int64`, `doc-last-ziel.int32`, `ppmd-bytes.uint8`, `ppmd-probs.float16` and `z3-prior0.float16`. Upstream's package builder assembles these together in its final `pkg_check` directory. The refiner memory-maps the prior matrix, uses the upstream prompt, target and mask rules, and holds out the last 10% of documents. The full prior matrix alone occupies about 203 GB. To generate it, use the unmodified upstream commit `35d1957a` as the package builder's `ENTRY`. [Package instructions and hardware requirements](../README.md) · [Package builder](../tf/2_package/build_package.sh)
+**The only source text is enwik9.** The upstream preprocessing tools turn that file into the training package. Its largest file stores 208 PPMd probabilities per position in float16. For 488,038,367 positions this takes 203,023,960,672 bytes. The upstream builder checks the raw enwik9 SHA-256. It requires 245 GiB of working space for a full run, and upstream reports about 45 GiB peak RAM during the package checks. [Data pipeline and hardware](../README.md) · [Package builder](../tf/2_package/build_package.sh)
 
 ```bash
-# One-time data preparation if you need to generate the package
-git worktree add --detach ../cmix-stage-c 35d1957a5074db802fc134126afc77b76d931761
-entry=$(cd ../cmix-stage-c && pwd)
-ENTRY="$entry" ENWIK9="/absolute/path/to/enwik9" DICT="$entry/dictionary/english.dic" \
-  ORDER="$entry/src/readalike_prepr/data/new_article_order" WORK="$HOME/cmix-training-data" \
-  bash "$entry/training/tf/2_package/build_package.sh"
+# Linux, from the fork root with the upstream package prerequisites installed
+bash training/refiner/prepare_enwik9.sh /absolute/path/to/enwik9 /data/cmix-training
 ```
+
+That command prepares the upstream package from commit `35d1957a`. If you already have its completed `pkg_check` directory, skip preparation.
+
+### Run the refiner with the upstream training budget
+
+On a Linux GPU host, the upstream lockfile provides the Python 3.11, CUDA PyTorch and FlashAttention 2 environment. The first training launch below uses four GPUs for b1. The second resumes from the saved epoch with eight GPUs for the remaining stages. Both commands use the same run directory. [Upstream environment](../README.md)
+
+```bash
+# Run from the fork root. Install uv first if the GPU image does not provide it.
+uv sync --project training/tf/tree_upstream --python 3.11 --frozen
+source training/tf/tree_upstream/.venv/bin/activate
+uv pip install --python "$VIRTUAL_ENV/bin/python" 'transformers>=4.45,<5'
+pkg=/data/cmix-training/pkg_check
+run=/data/refiner-enwik9
+torchrun --standalone --nproc-per-node=4 training/refiner/train_enwik9.py \
+  --package "$pkg" --run-dir "$run" --until-stage b1
+torchrun --standalone --nproc-per-node=8 training/refiner/train_enwik9.py \
+  --package "$pkg" --run-dir "$run"
+```
+
+The full trainer uses all upstream training documents, the same seed-0 permutations, microbatch grouping, trailing-batch rule, prompt rows, targets, PPMd priors and loss masks. It reads the checked-in upstream stage configurations for the 2,048-position attention window, epoch counts and learning rates. Each optimizer update groups eight microbatches of up to 131,072 rows. Within a microbatch the trainer groups whole documents by length to limit GPU memory. It runs 100 + 100 + 400 BF16 epochs, 96 Q4-aware epochs and 16 FP32 cooldown epochs with the quantized weights in the forward pass. Muon updates the shared block matrices and AdamW updates the remaining parameters. Checkpoints are saved after every epoch. Repeating a launch resumes from the last saved epoch. [Refiner training code](train_enwik9.py) · [Upstream stage configurations](../tf/3_train/chain)
+
+The refiner starts from a seeded random initialization. Upstream started from transformer weights previously trained on another preprocessing of enwik9. The refiner uses its tied byte head, PPMd gate and per-row Q4 format. The upstream model also uses predecessor and match embeddings, learned quantizer scales, integer activation quantization, Fisher allocation and a container-size penalty. These differences matter when interpreting an architecture comparison. Final evaluation scores all 487,298,491 eligible training positions and writes `$run/recursive-refiner.rrb`. Upstream reports 1.4051 in-sample bits per scored token for its strict evaluation. Archive size is measured separately with the compressor. [Upstream training results](../tf/3_train/chain/results/fp32.json)
+
+### Shorter held-out experiment
+
+The simpler trainer samples cropped spans and holds out the last 10% of documents. This example uses the same stage-C input files and a smaller user-selected training budget.
 
 ```bash
 # From the fork root, with CUDA-enabled PyTorch and the completed package

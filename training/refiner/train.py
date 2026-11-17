@@ -40,6 +40,24 @@ class FakeQ4(torch.nn.Module):
         return codes * scale + (weight - weight.detach())
 
 
+def enable_q4(model):
+    for layer in list(model.modules()):
+        if isinstance(layer, (torch.nn.Linear, torch.nn.Embedding)):
+            parametrize.register_parametrization(layer, "weight", FakeQ4())
+
+
+def make_model(dims, window, max_positions):
+    d, heads, ff, blocks, h, l = dims
+    config = RecursiveRefinerConfig(vocab_size=INPUT_ROWS, hidden_size=d, num_attention_heads=heads,
+        num_hidden_layers=blocks, expansion=ff/d, hi_cycles=h, lo_cycles=l, embed_factor=1,
+        is_causal=True, max_position_embeddings=max(max_positions, 2*window+5))
+    model = RecursiveRefinerModel(config)
+    for block in model.shared.blocks:
+        block.attn.window_size = window
+    model.prior_gate = torch.nn.Parameter(torch.zeros(d))
+    return model
+
+
 def tensors_for_export(model, window):
     yield model.embed.tok
     yield from (model.hi_init, model.lo_init, model.prior_gate)
@@ -250,14 +268,7 @@ def main():
     if 2 * blocks * h * (l + 1) * d * window > 2**27:
         p.error("this configuration exceeds the native 512 MiB KV cache limit")
     dims = (d, heads, ff, blocks, h, l)
-    config = RecursiveRefinerConfig(vocab_size=INPUT_ROWS, hidden_size=d, num_attention_heads=heads,
-        num_hidden_layers=blocks, expansion=ff/d, hi_cycles=h, lo_cycles=l, embed_factor=1,
-        is_causal=True, max_position_embeddings=max(args.context, 2*window+5))
-    model = RecursiveRefinerModel(config)
-    for block in model.shared.blocks:
-        block.attn.window_size = window
-    model.prior_gate = torch.nn.Parameter(torch.zeros(d))
-    model = model.to(args.device)
+    model = make_model(dims, window, args.context).to(args.device)
     count = sum(t.numel() for t in model.parameters())
     print(f"{args.preset}: {count:,} trainable parameters; baseline 9,285,596", flush=True)
     if not args.package and not (args.demo_dir/"train.f16").exists():
@@ -271,9 +282,7 @@ def main():
     trained = 0
     for step in range(args.steps):
         if step == args.steps - qat_steps:
-            for layer in list(model.modules()):
-                if isinstance(layer, (torch.nn.Linear, torch.nn.Embedding)):
-                    parametrize.register_parametrization(layer, "weight", FakeQ4())
+            enable_q4(model)
         for attempt in range(100):
             x, y, prior = train.batch(rng, args.batch, args.device)
             if (y != -100).any(): break

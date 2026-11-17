@@ -249,6 +249,7 @@ class SelfAttention(nn.Module):
         self.is_causal = bool(is_causal)
         self.use_sdpa = bool(use_sdpa)
         self.window_size = None
+        self.whole_documents = False
 
         self.q_proj = nn.Linear(dim, dim, bias=True)
         self.k_proj = nn.Linear(dim, dim, bias=True)
@@ -313,12 +314,38 @@ class SelfAttention(nn.Module):
 
         if self.rope is not None:
             cos, sin = self.rope(t)
-            cos = cos.to(device=x.device, dtype=x.dtype)
-            sin = sin.to(device=x.device, dtype=x.dtype)
+            rotary_dtype = q.dtype if self.whole_documents else x.dtype
+            cos = cos.to(device=x.device, dtype=rotary_dtype)
+            sin = sin.to(device=x.device, dtype=rotary_dtype)
             q = apply_rope(q, cos, sin)
             k = apply_rope(k, cos, sin)
 
-        if self.use_sdpa and hasattr(F, "scaled_dot_product_attention"):
+        if self.whole_documents and self.use_sdpa and self.is_causal and attention_mask is None:
+            if t <= self.window_size:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            elif q.is_cuda and q.dtype == torch.bfloat16:
+                from flash_attn import flash_attn_func
+                y = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                                    causal=True, window_size=(self.window_size - 1, 0)).transpose(1, 2)
+            else:
+                # Bound mask and score memory for whole documents in FP32.
+                pieces = []
+                for start in range(0, t, 256):
+                    end = min(start + 256, t)
+                    left = max(0, start - self.window_size + 1)
+                    def attend(qpart, kpart, vpart, offset=start-left):
+                        pos = torch.arange(qpart.size(2), device=qpart.device)[:, None] + offset
+                        age = pos - torch.arange(kpart.size(2), device=qpart.device)
+                        mask = (age >= 0) & (age < self.window_size)
+                        return F.scaled_dot_product_attention(qpart, kpart, vpart, attn_mask=mask)
+                    args = (q[:, :, start:end], k[:, :, left:end], v[:, :, left:end])
+                    if t > 4096 and torch.is_grad_enabled():
+                        from torch.utils.checkpoint import checkpoint
+                        pieces.append(checkpoint(attend, *args, use_reentrant=False))
+                    else:
+                        pieces.append(attend(*args))
+                y = torch.cat(pieces, dim=2)
+        elif self.use_sdpa and hasattr(F, "scaled_dot_product_attention"):
             sdpa_mask = self._build_sdpa_mask(attention_mask, b, t, q.device)
             y = F.scaled_dot_product_attention(
                 q,
@@ -382,11 +409,16 @@ class SharedReasoningStack(nn.Module):
     def __init__(self, blocks: nn.ModuleList):
         super().__init__()
         self.blocks = blocks
+        self.checkpoint_blocks = False
 
     def forward(self, z: torch.Tensor, inject: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         z = z + inject
         for blk in self.blocks:
-            z = blk(z, attention_mask=attention_mask)
+            if self.checkpoint_blocks and torch.is_grad_enabled():
+                from torch.utils.checkpoint import checkpoint
+                z = checkpoint(blk, z, attention_mask, use_reentrant=False)
+            else:
+                z = blk(z, attention_mask=attention_mask)
         return z
 
 
