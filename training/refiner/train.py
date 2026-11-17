@@ -1,5 +1,6 @@
 """Train the causal nested byte model and export it for src/refiner/."""
 import argparse
+import json
 import math
 import struct
 import sys
@@ -23,6 +24,7 @@ INPUT_ROWS = 216
 PRESETS = {
     # width, heads, FFN, shared blocks, high cycles, low cycles
     "smoke": (192, 3, 64, 1, 2, 1),
+    "compact": (192, 3, 192, 1, 2, 1),
     "matched": (512, 8, 2298, 2, 2, 3),
 }
 
@@ -88,14 +90,23 @@ def export(model, dims, window, path):
 
 def demo_docs(path):
     docs, priors = [], []
-    for name in ("train", "valid"):
+    groups = [["train"], ["valid"]]
+    if (path / "pilot.json").is_file():
+        manifest = json.loads((path / "pilot.json").read_text())
+        groups = [[doc["name"] for doc in manifest[split]] for split in ("train", "valid")]
+        names = groups[0] + groups[1]
+        if not all(groups) or len(set(names)) != len(names):
+            raise ValueError("pilot requires nonempty, disjoint training and validation excerpts")
+    offset = 0
+    for name in groups[0] + groups[1]:
         ids = np.fromfile(path / f"{name}.ids", dtype="u1")
         rows = np.fromfile(path / f"{name}.f16", dtype="<f2").reshape(-1, VOCAB)
         if len(rows) != len(ids) or len(ids) < 2 or ids.max() >= VOCAB:
             raise ValueError("invalid profiling IDs or prior trace")
-        docs.append((ids[:-1], ids[1:], np.arange(len(ids)-1) + sum(map(len, priors))))
+        docs.append((ids[:-1], ids[1:], np.arange(len(ids)-1) + offset))
+        offset += len(ids)
         priors.append(rows)
-    return (docs.__getitem__, np.array([len(d[0]) for d in docs]), 1,
+    return (docs.__getitem__, np.array([len(d[0]) for d in docs]), len(groups[0]),
             np.concatenate(priors), np.zeros(VOCAB, np.float16))
 
 
@@ -229,7 +240,7 @@ def main():
     p.add_argument("--ffn-width", type=int, help="SwiGLU intermediate width")
     p.add_argument("--package", type=Path, help="upstream stage-C directory (default: profiling demo)")
     p.add_argument("--demo-dir", type=Path, default=ROOT/"build-refiner/demo",
-                   help="profiling IDs and PPMd rows written by prepare_demo.py")
+                help="IDs and PPMd rows from prepare_demo.py or prepare_pilot.py")
     p.add_argument("--steps", type=int, default=64)
     p.add_argument("--context", type=int, default=64, help="training crop length")
     p.add_argument("--window", type=int, help="causal attention window (default: half the training crop)")
@@ -271,8 +282,8 @@ def main():
     model = make_model(dims, window, args.context).to(args.device)
     count = sum(t.numel() for t in model.parameters())
     print(f"{args.preset}: {count:,} trainable parameters; baseline 9,285,596", flush=True)
-    if not args.package and not (args.demo_dir/"train.f16").exists():
-        p.error("prepare profiling priors with training/refiner/prepare_demo.py, or specify --package")
+    if not args.package and not any((args.demo_dir/f).is_file() for f in ("train.f16", "pilot.json")):
+        p.error("prepare priors with prepare_demo.py or prepare_pilot.py, or specify --package")
     document, lengths, split, priors, prior0 = package_docs(args.package) if args.package else demo_docs(args.demo_dir)
     train = Blocks(document, lengths[:split], 0, args.context, window, priors, prior0)
     valid = Blocks(document, lengths[split:], split, args.context, window, priors, prior0)

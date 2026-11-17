@@ -19,7 +19,7 @@ BYTE_MODEL="${BYTE_MODEL:-refiner}"
 case "$BYTE_MODEL" in
   transformer) ;;
   refiner)
-    RR_SOURCE="$(realpath "${REFINER_WEIGHTS:-$SOURCE/recursive-refiner.rrb}")"
+    RR_SOURCE="$(realpath "${REFINER_WEIGHTS:-$SOURCE/recursive-refiner-compact.rrb}")"
     [ -s "$RR_SOURCE" ] || { echo "Export the refiner checkpoint first." >&2; exit 1; } ;;
   *) echo "BYTE_MODEL must be transformer or refiner" >&2; exit 1 ;;
 esac

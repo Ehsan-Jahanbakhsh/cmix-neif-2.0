@@ -2,6 +2,8 @@
 
 This fork uses Ehsan Jahanbakhsh’s shared high/low Recursive Refiner blocks as the cmix byte model, with sliding-window attention, a learned PPMd output gate and 4-bit weights. The matched preset has **9,285,096 trainable parameters**, 500 fewer than the upstream transformer. Train and score the neural model independently in PyTorch and run the exported model in native C++ inside the compressor and decompressor. [Standalone training, CLI tools and compression commands](training/refiner/README.md)
 
+`build.sh` packages the **compact refiner** by default. It has 301,824 parameters and uses four shared-block evaluations per byte. Its 198,016-byte checkpoint was trained on excerpts from the original enwik9 coder stream. You can reproduce the laptop pilot with 26 MiB of PPMd training and validation data. [Compact checkpoint](recursive-refiner-compact.rrb) · [Commands and held-out comparison](training/refiner/README.md#compact-enwik9-pilot)
+
 The original submission and its measurements are documented below. To reproduce its build in this fork, select `BYTE_MODEL=transformer`.
 
 ## Original cmix-neif-2.0 submission

@@ -75,8 +75,9 @@ def examples(articles, document, lengths, priors, prior0, device):
     return (torch.from_numpy(a).to(device) for a in (x, y, p))
 
 
-def document_loss(model, batch, use_bf16):
+def document_loss(model, batch, use_bf16, checkpoint_from_rows):
     x, y, prior = batch
+    model.shared.checkpoint_blocks = x.numel() >= checkpoint_from_rows
     with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=use_bf16):
         high = model(x).last_hidden_state
         scores = byte_head(model, high, prior)
@@ -138,10 +139,8 @@ def run(args, device, rank, world):
     b3_cont = json.loads((CHAIN / "03_b3_bf16_epochs_30_to_400.json").read_text())
     epochs = [1 if args.smoke else c["epochs"] for c in configs]
     window = configs[0]["overrides"]["window_size"]
-    if args.smoke:
-        dims = PRESETS["smoke"]
-    else:
-        dims = PRESETS["matched"]
+    dims = PRESETS[args.preset or ("smoke" if args.smoke else "matched")]
+    if not args.smoke:
         if (args.package/"ppmd-probs.float16").stat().st_size != 203023960672:
             raise ValueError("full run needs the original stage-C enwik9 package (203023960672 prior bytes)")
         manifest = args.package / "MANIFEST.json"
@@ -161,7 +160,9 @@ def run(args, device, rank, world):
         raise ValueError("run settings or package differ from the saved run")
     torch.manual_seed(configs[0]["seed"])
     model = make_model(dims, window, int(lengths.max())).to(device)
-    model.shared.checkpoint_blocks = True
+    checkpoint_from_rows = args.checkpoint_from_rows
+    if checkpoint_from_rows is None:
+        checkpoint_from_rows = 8193 if args.preset == "compact" else 1
     for block in model.shared.blocks:
         block.attn.whole_documents = True
     if rank == 0:
@@ -217,7 +218,7 @@ def run(args, device, rank, world):
                     for ids in groups[rank::world]:
                         for chunk in padded_batches(ids, lengths, args.forward_rows):
                             batch = examples(chunk, document, lengths, priors, prior0, device)
-                            loss, n = document_loss(model, batch, name != "fp32")
+                            loss, n = document_loss(model, batch, name != "fp32", checkpoint_from_rows)
                             (loss / plan.gradient_accumulation_steps).backward()
                             stats += torch.stack((loss.detach(), n)).double()
                     reduce_gradients(model, world)
@@ -245,7 +246,8 @@ def run(args, device, rank, world):
         for i, ids in enumerate(plan._iter_micro_batch_articles(range(len(lengths)), drop_last=False)):
             if i % world == rank:
                 for chunk in padded_batches(ids, lengths, args.forward_rows):
-                    loss, n = document_loss(model, examples(chunk, document, lengths, priors, prior0, device), False)
+                    batch = examples(chunk, document, lengths, priors, prior0, device)
+                    loss, n = document_loss(model, batch, False, checkpoint_from_rows)
                     stats += torch.stack((loss, n)).double()
     if world > 1:
         dist.all_reduce(stats)
@@ -263,15 +265,20 @@ def main():
     p.add_argument("--package", type=Path, required=True, help="completed upstream pkg_check directory")
     p.add_argument("--run-dir", type=Path, required=True, help="checkpoint, resume state and export directory")
     p.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    p.add_argument("--preset", choices=("compact", "matched"), help="model size (default: matched for a full run)")
     p.add_argument("--until-stage", choices=STAGES, default="fp32")
     p.add_argument("--micro-rows", type=int, default=131072)
     p.add_argument("--update-rows", type=int, default=1048576)
     p.add_argument("--forward-rows", type=int, default=8192, help="padding budget per forward, whole documents retained")
+    p.add_argument("--checkpoint-from-rows", type=int, help="recompute blocks during backward at or above this many "
+                   "padded rows per forward (default: 8193 for compact, 1 otherwise)")
     p.add_argument("--smoke", action="store_true", help="small model and one epoch per stage on a test package")
     args = p.parse_args()
     world, rank = int(os.environ.get("WORLD_SIZE", 1)), int(os.environ.get("RANK", 0))
     if min(args.forward_rows, args.micro_rows, args.update_rows) < 1 or args.update_rows % (args.micro_rows*world):
         p.error("row budgets must be positive and update-rows divisible by micro-rows times ranks")
+    if args.checkpoint_from_rows is not None and args.checkpoint_from_rows < 1:
+        p.error("checkpoint-from-rows must be positive")
     device = torch.device(args.device)
     if args.device == "cuda":
         device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))

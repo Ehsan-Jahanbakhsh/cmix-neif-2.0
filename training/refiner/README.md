@@ -20,6 +20,58 @@ clang++-18 -std=c++17 -O3 -march=x86-64-v3 -ffp-model=precise -ffp-contract=off 
   src/refiner/refiner.cpp src/tf1/opt/glue.cpp src/detmath.cpp -o build-refiner/refiner-check
 ```
 
+## Compact enwik9 pilot
+
+The compact preset keeps the high and low states, sliding attention, PPMd output gate and both 192-feature connections to cmix. It uses one shared block of width 192, three attention heads, a 192-wide SwiGLU and two rounds of one low update followed by one high update. This gives four block evaluations per byte and **301,824 trainable parameters**. The 64-token-window Q4 checkpoint is **198,016 bytes**. The Hutter score counts the weights twice because both executables carry a copy. At this window the compact weights save **9,196,160 bytes** against the matched refiner before accounting for any change in the coded payload.
+
+The pilot uses only the original transformed enwik9 stream. The preparation command checks the upstream SHA-256, samples 16 disjoint 4,096-byte excerpts spaced across its body and holds out every fourth excerpt. Each excerpt starts with a fresh PPMd state. This produces 26 MiB of priors across both splits. The full upstream package preserves document prompts, article boundaries and prior history. The pilot measures body excerpts from a cold start. [Upstream coder-stream preparation](../tf/1_dump/README.md)
+
+With the sample binaries built as above and PyTorch, Transformers 4.x and NumPy installed, run the following from the fork root. Use Python 3.11 or newer for preparation. Set `stream` to the upstream coder stream. The upstream preprocessing-only `cmix_stream` tool writes it as `out.cmix.temp` and exits before arithmetic coding. A local compressor run can leave the same bytes in `archive9.cmix.temp`. [Building and running the upstream stream tool](../tf/1_dump/README.md#1-the-bed-run)
+
+```bash
+stream=/absolute/path/to/archive9.cmix.temp
+build=build-refiner
+pilot=$build/pilot
+python3 training/refiner/prepare_pilot.py "$build/cmix-refiner" "$stream" "$pilot"
+python training/refiner/train.py --preset compact --demo-dir "$pilot" \
+  --steps 512 --qat-steps 128 --context 128 --window 64 --batch 2 --seed 1 --threads 6 \
+  --out "$build/compact/recursive-refiner.rrb" --parity "$build/compact/parity.bin"
+"$build/refiner-check" "$build/compact/recursive-refiner.rrb" "$build/compact/parity.bin"
+python3 training/refiner/benchmark.py "$build" --pilot "$pilot" --ppmd-baseline \
+  --refiner-weights "$build/compact/recursive-refiner.rrb"
+```
+
+`--pilot` always scores predictions. It resets cmix for every held-out excerpt, then reports total bits divided by the total number of scored rows and wall time including startup. Use `--model refiner` to time only your checkpoint. Use `--excerpts` (a multiple of four) and `--excerpt-bytes` at preparation time to increase the data budget. Each additional sampled byte costs 416 bytes of PPMd priors. For a larger comparison, score both refiners on the same new split.
+
+### Pilot results
+
+All native scores below cover the same 16,380 next-byte predictions. Lower is better. The two 128-step runs used the same 16,382 training targets, seed, crops, 64-byte window, optimizer and final 32 steps of Q4-aware training. The 512-step compact run saw 65,517 targets sampled from the same 12 excerpts and used Q4 for its final 128 steps. Its weights are the included `recursive-refiner-compact.rrb`.
+
+| Byte predictor | Train and export | Held-out bits per scored byte | C++ score time |
+|---|---:|---:|---:|
+| PPMd alone, with the refiner's probability floor | — | 3.473822 | — |
+| Matched refiner, 128 steps | 154.17 s | 3.566580 | 207.67 s |
+| Compact refiner, 128 steps | 20.59 s | 3.469910 | 26.33 s |
+| Compact refiner, 512 steps | 39.38 s | 3.211155 | 21.00 s |
+| Shipped upstream transformer | Upstream checkpoint | 1.658221 | 30.51 s |
+
+Times are single wall-clock measurements on a Ryzen 7 8845HS laptop. PyTorch training ran on Windows with six CPU threads, including validation and parity export. Native scoring ran under WSL Ubuntu and includes four process startups and cmix predictor updates. The difference between the two compact scoring times gives an indication of timing variation for identical dimensions. The holdout applies to the two trained refiner sizes. Upstream trained on the full enwik9 stream, including these excerpts, and uses additional side inputs. The final prize score requires the actual archive and executable sizes.
+
+For a runtime estimate, the compact C++ scorer processed 1,024-byte and 24,576-byte prefixes starting at each of the four held-out offsets. Dividing the additional 94,208 bytes by the additional 61.8 seconds gives about 1,525 body bytes/second. Applying that rate to 488 million body positions gives about **89 hours** on this laptop. Individual offsets imply roughly 49–125 hours. A full run uses the packaged binary, persistent context, preprocessing and arithmetic coding, so treat four days as a rough planning figure. The archive size and end-to-end runtime are unmeasured.
+
+The fx2-cmix-transformer authors found that 512 tokens of attention context gave higher loss than 1,024 in their model. Beehive sped up the whole compressor by about 3% with a bit-identical fused attention kernel for its shared key/value heads. For this refiner, increasing training coverage while keeping the target window fixed is a separate experiment from shortening attention or changing the number of recursive steps. Kernel timing and prediction parity can be checked independently of either change. [fx2-cmix-transformer experiments](https://github.com/astOwOlfo/fx2-cmix-transformer-v1/blob/main/writeup.md) · [Beehive inference measurements](https://github.com/galqiwi/cmix-neif-beehive/blob/92c07c0b/README.md#32-inference-engine-srctf1)
+
+To package the included pilot checkpoint in a fresh Linux working directory, start from the fork root, with the original `enwik9` available for your run. With an existing RRB2 compressor, the weight replacement utility at the end of this guide avoids rebuilding.
+
+```bash
+repo=$(pwd)
+mkdir -p ~/cmix-refiner-compact-run
+cd ~/cmix-refiner-compact-run
+REFINER_WEIGHTS="$repo/recursive-refiner-compact.rrb" BYTE_MODEL=refiner bash "$repo/build.sh"
+```
+
+For the full enwik9 training recipe below, add `--preset compact` to each launch and start a new run directory. This keeps the upstream 2,048-token window and training schedule. The compact full trainer stores activations for batches of up to 8,192 padded rows and recomputes the shared blocks for larger batches to conserve memory. Set `--checkpoint-from-rows 1` to recompute on every training forward if memory is tight. Both settings produced a byte-identical exported checkpoint on the CPU test fixture. The included 512-step pilot checkpoint passed the 200-row streaming C++ versus PyTorch check with a maximum absolute probability difference of 0.000000239.
+
 ## Train the refiner separately
 
 The first command below the install steps prepares the bundled profiling text. It lowercases the bytes, filters to cmix's frozen alphabet, reserves the final 10% for validation and runs PPMd independently on each split. Each retained byte takes 416 bytes of prior data on disk. For a small text corpus of your own, append `--input my-text.txt` to the preparation command. Once the priors exist, the trainer runs independently of cmix.
@@ -146,7 +198,7 @@ cmp enwik9 enwik9_uncompressed
 wc -c comp9 archive9
 ```
 
-This build uses the included demonstration checkpoint. To embed your own checkpoint at build time, set `REFINER_WEIGHTS` to its absolute path. Once you have a packaged Q4 refiner executable, you can install another exported checkpoint in a **new** executable. This copies the compiled code, dictionary hints and article order, and updates the embedded weights and size trailer. The checkpoint specifies the window size, block count and cycle counts at load time.
+This build uses the included compact enwik9 pilot checkpoint. For the 9.3M demonstration checkpoint, set `REFINER_WEIGHTS="$repo/recursive-refiner.rrb"` on the build command. To embed your own checkpoint at build time, set `REFINER_WEIGHTS` to its absolute path. Once you have a packaged Q4 refiner executable, you can install another exported checkpoint in a **new** executable. This copies the compiled code, dictionary hints and article order, and updates the embedded weights and size trailer. The checkpoint specifies the window size, block count and cycle counts at load time.
 
 ```bash
 python3 "$repo/training/refiner/replace_weights.py" ./comp9 \
