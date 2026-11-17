@@ -29,8 +29,12 @@
 #include "tf1_prompt.h"  // prompt rows (article number, synonyms, headings)
 #include "tf1_gate.h"    // gate zones
 
+#ifdef CMIX_REFINER
+#include "../refiner/refiner.h"
+#else
 #include "model.h"          // fp32 reference engine (Ivanov, cpp_infer/src)
 #include "opt/model_opt.h"  // optimized engine  (Ivanov, cpp_infer/src/opt)
+#endif
 static_assert(300 >= 0 && 300 <= 10000,
               "is the floor in units of 1e-10 (0 = 1e-6)");
 // Floor of the transformer row handed to its slot.  The row arrives as float16
@@ -248,7 +252,11 @@ struct Tf1Row {
 };
 
 struct Tf1Engine::Impl {
+#ifdef CMIX_REFINER
+  rr::Model* opt;
+#else
   fx2::opt::TransformerOpt* opt;
+#endif
 
   int byte_to_index[256];
   int vocab_bytes[208];
@@ -317,6 +325,9 @@ struct Tf1Engine::Impl {
   __attribute__((noinline)) void Feed(int tok, const uint16_t* prior, bool inserted, float* out
             , bool gelesen
            ) {
+#ifdef CMIX_REFINER
+    opt->step(tok, out, gelesen);
+#else
     if (opt) opt->set_gelesen(gelesen);
     fx2::PaketChannels ch;
     ch.prev1 = pk_prev1;
@@ -324,6 +335,7 @@ struct Tf1Engine::Impl {
     ch.match_byte = inserted ? 208 : m_hot;
     ch.match_class = inserted ? 0 : (m_class & 15);
     opt->step((uint8_t)tok, prior, out, ch);
+#endif
     pk_prev2 = pk_prev1;
     pk_prev1 = tok;
     ++doc_rows;
@@ -386,11 +398,12 @@ LOAD_PATH_ATTR Tf1Engine::Tf1Engine(const std::vector<bool>& vocab, const char* 
   // real tokens have been seen.
   memset(impl_->window, 0xFF, sizeof(impl_->window));
 
-  // The coder always runs the optimized int8 engine; the fp32 reference path
-  // is not used.
-  const bool use_ref = false;
+#ifdef CMIX_REFINER
+  impl_->opt = new rr::Model(weights_path);
+#else
   impl_->opt = new fx2::opt::TransformerOpt(weights_path,
       fx2::opt::AttnKind::KVI8);
+#endif
   {
     tf_z3::Params zp;
     impl_->z3 = new tf_z3::CoderZ3(zp);
@@ -422,6 +435,28 @@ LOAD_PATH_ATTR Tf1Engine::~Tf1Engine() {
 const float* Tf1Engine::Step(const std::valarray<float>& ppmd,
     unsigned int byte) {
   Impl& s = *impl_;
+#ifdef CMIX_SAMPLE
+  // A short body excerpt has no enwik9 metadata preamble. Feed every byte
+  // directly; keep the real match channel, PPMd prior and output rounding.
+  if (sample_body_stream) {
+    int token = s.byte_to_index[byte];
+    if (token < 0) Fail("sample byte %02x outside frozen vocabulary", byte);
+    if (s.doc_rows == kMaxArticleTokens) s.NewDocument();
+    if (s.doc_rows == 0) s.opt->begin_article();
+#ifndef CMIX_REFINER
+    if (s.fw_have && s.fw_live) s.opt->fw_update((uint8_t)token);
+#endif
+    s.fw_live = false;
+    for (int i = 0; i < 208; ++i) s.probs[i] = ppmd[s.vocab_bytes[i]];
+    RowToHalves(s.probs.data(), s.half.data());
+    s.Feed(token, s.half.data(), false, s.tf_out.data(), true);
+    RowToHalves(s.tf_out.data(), s.half.data());
+    RowToFloats(s.half.data(), s.probs.data());
+    RowFloor(s.probs.data(), 3e-8f);
+    s.probs_from_tf = true;
+    return s.probs.data();
+  }
+#endif
   if (timestamp_skip::Laeuft()) return s.probs.data();
   if (alias_prompt::Laeuft()) {
     if (comment_tag::g_j < 2) byte = comment_tag::g_tf[comment_tag::g_j++];
@@ -485,9 +520,11 @@ const float* Tf1Engine::Step(const std::valarray<float>& ppmd,
   }
   // The fast-weight target is this stream token, if it was coded
   // with a second-head row.
+#ifndef CMIX_REFINER
   if (s.fw_have && s.fw_live && s.opt) {
     s.opt->fw_update((uint8_t)token);
   }
+#endif
   s.fw_have = false;
   s.fw_live = false;
   const bool ta_tok = metablock::mk.ImTextanfang();
@@ -737,6 +774,9 @@ bool Tf1Engine::GateMasked() const { return impl_->gate_masked; }
 // fast weights after ex-girlfriend 1.0 (Ryan Landay,
 // GPL-3.0-only): see tf1_engine.h.
 const float* Tf1Engine::FwRow() {
+#ifdef CMIX_REFINER
+  return nullptr;  // This model has one tied output head.
+#else
   Impl& s = *impl_;
   if (s.probs_from_tf && s.opt) {
     // the same float16 rounding and 1e-6 floor as the transformer row
@@ -749,6 +789,7 @@ const float* Tf1Engine::FwRow() {
     s.fw_live = false;
   }
   return s.fw_row.data();
+#endif
 }
 
 void Tf1Engine::FwNeutral() { impl_->fw_live = false; }
@@ -758,7 +799,7 @@ const float* Tf1Engine::LastHidden() const {
   return impl_->opt ? impl_->opt->last_hidden() : nullptr;
 }
 int Tf1Engine::HiddenSize() const {
-  return impl_->opt ? fx2::opt::TransformerOpt::hidden_size() : 0;
+  return impl_->opt ? impl_->opt->hidden_size() : 0;
 }
 const float* Tf1Engine::LastKey() const {
   return impl_->opt ? impl_->opt->last_key() : nullptr;

@@ -284,7 +284,11 @@ __attribute__((noinline)) void Predictor::FwSetNeutral() {
   tf1_engine_->FwNeutral();
 }
 __attribute__((noinline)) void Predictor::FwSetRow() {
+#ifdef CMIX_REFINER
+  fw_slot_->SetProbsOff();
+#else
   fw_slot_->SetProbs(tf1_engine_->FwRow());
+#endif
 }
 __attribute__((noinline)) void Predictor::FwSetOff() {
   fw_slot_->SetProbsOff();

@@ -914,7 +914,98 @@ bool RunDecompression(const std::string& input_path,
 }
 
 namespace ppmd_page { extern int hilfs; }
+#ifdef CMIX_SAMPLE
+// Feed the actual PPMd and match channels without starting an arithmetic coder.
+static int SampleScore(const char* reference) {
+  transformer::sample_body_stream = true;
+  FILE* input = fopen(reference, "rb");
+  if (!input) { perror(reference); return 1; }
+  srand(SEED);
+  ppmd_page::hilfs = 1;
+  std::vector<bool> vocab(256);
+  vocab_frozen::FillVocab(&vocab);
+  Predictor p(vocab);
+  double bits = 0;
+  size_t scored = 0, pos = 0;
+  for (int byte; (byte = getc(input)) != EOF; ++pos) {
+    if (!vocab[byte]) { fprintf(stderr, "outside frozen alphabet at %zu\n", pos); return 1; }
+    if (const auto* row = p.LiveByteRow()) {
+      bits -= std::log2((*row)[byte] / row->sum());
+      ++scored;
+    }
+    for (int i = 7; i >= 0; --i) {
+      int bit = (byte >> i) & 1, forced = p.ChrForced();
+      if (forced && (forced > 0) != bool(bit)) {
+        fprintf(stderr, "sample violates cmix forced bit at %zu\n", pos); return 1;
+      }
+      p.ObserveKnownBit(bit);
+    }
+  }
+  bool ok = !ferror(input) && scored > 0 && std::isfinite(bits);
+  fclose(input);
+  if (ok) printf("byte model: %.6f bits/scored byte (%zu live rows of %zu)\n", bits/scored, scored, pos);
+  else fprintf(stderr, "could not score sample (%zu live rows of %zu bytes)\n", scored, pos);
+  return ok ? 0 : 1;
+}
+
+// Isolated mixer benchmark on bytes from the frozen alphabet. Each process
+// starts the predictor from scratch. The reference file only supplies the
+// length and the equality check during decode.
+static int SampleRoundTrip(bool verify, const char* reference, const char* payload) {
+  transformer::sample_body_stream = true;
+  FILE* input = fopen(reference, "rb");
+  if (!input) { perror(reference); return 1; }
+  FILE* coded = fopen(payload, verify ? "rb" : "wbx");
+  if (!coded) { perror(payload); fclose(input); return 1; }
+  srand(SEED);
+  ppmd_page::hilfs = 1;
+  std::vector<bool> vocab(256);
+  vocab_frozen::FillVocab(&vocab);
+  Predictor p(vocab);
+  int previous = 0;
+  size_t pos = 0;
+  if (verify) {
+    Decoder d(coded, &p);
+    for (int wanted; (wanted = getc(input)) != EOF; ++pos) {
+      p.SemByteStart(previous);
+      int value = 1;
+      while (value < 256) value = 2 * value + d.Decode();
+      previous = value - 256;
+      if (previous != wanted) {
+        fprintf(stderr, "decoded byte differs at offset %zu\n", pos);
+        return 1;
+      }
+    }
+  } else {
+    Encoder e(coded, &p);
+    for (int byte; (byte = getc(input)) != EOF; ++pos) {
+      if (!vocab[byte]) { fprintf(stderr, "outside frozen alphabet at %zu\n", pos); return 1; }
+      p.SemByteStart(previous);
+      for (int shift = 7; shift >= 0; --shift) {
+        const int bit = (byte >> shift) & 1;
+        const int forced = p.ChrForced();
+        if (forced && (forced > 0) != bool(bit)) {
+          fprintf(stderr, "sample violates cmix forced bit at %zu\n", pos); return 1;
+        }
+        e.Encode(bit);
+      }
+      previous = byte;
+    }
+    e.Flush();
+  }
+  bool ok = !ferror(input) && !ferror(coded);
+  fclose(input);
+  if (fclose(coded) != 0) ok = false;
+  if (ok) fprintf(stderr, "%s %zu sample bytes\n", verify ? "verified" : "encoded", pos);
+  return ok ? 0 : 1;
+}
+#endif
 int main(int argc, char** argv) {
+#ifdef CMIX_SAMPLE
+  if (argc == 3 && !strcmp(argv[1], "--sample-score")) return SampleScore(argv[2]);
+  if (argc == 4 && (!strcmp(argv[1], "--sample-write") || !strcmp(argv[1], "--sample-verify")))
+    return SampleRoundTrip(!strcmp(argv[1], "--sample-verify"), argv[2], argv[3]);
+#endif
   console_progress::Begin();
   if (argc == 1 && no_args::IsCompressor()) {
     argc = 4;
@@ -1150,10 +1241,10 @@ int main(int argc, char** argv) {
     // file archive9 itself (the jury form writes its output there).
     {
       ArchivKopf header;
-      header.weights_size = (int)getFileSize("weights-poc8m_w2048_tf2t3_pruned_v5k_np2.c5");
+      header.weights_size = (int)getFileSize(CMIX_BYTE_WEIGHTS);
       header.decomp_input_size = (int)getFileSize(output_path.c_str());
       const char* const teile[] = {".decomp_bin",
-                                   "weights-poc8m_w2048_tf2t3_pruned_v5k_np2.c5",
+                                   CMIX_BYTE_WEIGHTS,
                                    output_path.c_str(), nullptr};
       if (!cat(temp_path.c_str(), teile, &header, sizeof(header)) ||
           rename(temp_path.c_str(), "archive9") != 0)

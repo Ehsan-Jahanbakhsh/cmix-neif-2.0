@@ -1,4 +1,10 @@
-# cmix-neif-2.0: a Hutter Prize entry
+# cmix-neif with Recursive Refiner
+
+This fork uses Ehsan Jahanbakhsh’s nested causal Recursive Refiner as the cmix byte model. The matched preset has **9,284,584 trainable parameters**. The upstream transformer has **9,285,596**. Training uses PyTorch and both the compressor and decompressor run native C++ inference. [Build, train, compare, and run](training/refiner/README.md)
+
+The original submission and its measurements are documented below. To reproduce its build in this fork, select `BYTE_MODEL=transformer`.
+
+## Original cmix-neif-2.0 submission
 
 **Submitted by Marcus Wölk, Ellefeld, Germany.**
 

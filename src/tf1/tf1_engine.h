@@ -28,6 +28,10 @@
 
 namespace transformer {
 
+#ifdef CMIX_SAMPLE
+inline bool sample_body_stream = false;
+#endif
+
 [[noreturn]] void Fail(const char* fmt, ...);
 
 // ---- float16 (contract with the training pipeline) ----

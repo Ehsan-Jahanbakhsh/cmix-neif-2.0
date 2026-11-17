@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "byte_weights.h"
 
 
 namespace selfx_clean {
@@ -27,7 +28,7 @@ inline void AfterDecompress() {
       ".main_decomp_restored\0"
       ".main_decomp_restored_sorted\0"
       ".vs3\0"
-      "weights-poc8m_w2048_tf2t3_pruned_v5k_np2.c5" "\0"
+      CMIX_BYTE_WEIGHTS "\0"
       "");
 }
 
@@ -44,7 +45,7 @@ inline void AfterCompress() {
       ".main_reordered\0"
       ".main_phda9prepr\0"
       ".ready4cmix\0"
-      "weights-poc8m_w2048_tf2t3_pruned_v5k_np2.c5" "\0"
+      CMIX_BYTE_WEIGHTS "\0"
       ".decomp_bin\0"
       "");
 }

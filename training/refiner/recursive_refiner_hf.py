@@ -1,0 +1,1028 @@
+"""
+recursive_refiner_hf.py
+
+A Hugging Face Transformers-compatible implementation of the "Recursive Refiner" model
+from your provided code, packaged as:
+
+- RecursiveRefinerConfig (PretrainedConfig)
+- RecursiveRefinerModel (PreTrainedModel base model; returns last_hidden_state)
+- RecursiveRefinerForMaskedLM (MLM; bidirectional attention)
+- RecursiveRefinerForCausalLM (autoregressive; causal attention)
+
+Key differences vs your original file:
+- Adds an optional causal attention mask when config.is_causal=True.
+- Adds HF-standard forward signatures and returns ModelOutput objects with loss/logits.
+- Implements vocab resizing for the factorized embedding (token factor matrix only).
+
+This file is intended to be imported directly, e.g.:
+
+    from recursive_refiner_hf import (
+        RecursiveRefinerConfig,
+        RecursiveRefinerForMaskedLM,
+        RecursiveRefinerForCausalLM,
+    )
+
+    cfg = RecursiveRefinerConfig(vocab_size=30522, max_position_embeddings=512)
+    model = RecursiveRefinerForMaskedLM(cfg)
+
+For causal LM training with Trainer:
+- Use DataCollatorForLanguageModeling(tokenizer, mlm=False)
+- Pass labels (Trainer does automatically) and the model shifts internally.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Optional, Tuple, Union, Dict, Any
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from transformers import PretrainedConfig, PreTrainedModel
+from transformers.modeling_outputs import (
+    BaseModelOutput,
+    MaskedLMOutput,
+    CausalLMOutputWithPast,
+    SequenceClassifierOutput,
+)
+
+
+# ============================================================
+# Normalization + FFN
+# ============================================================
+
+class RootMeanSquareNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [..., D]
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        return (x / rms) * self.weight
+
+
+class SwiGLUFeedForward(nn.Module):
+    """
+    SwiGLU FFN:
+      a,b = Linear(x) split in half
+      out = Linear( silu(a) * b )
+    """
+    def __init__(self, dim: int, expansion: float = 4.0):
+        super().__init__()
+        hidden = int(dim * expansion)
+        self.fc1 = nn.Linear(dim, 2 * hidden, bias=True)
+        self.fc2 = nn.Linear(hidden, dim, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a, b = self.fc1(x).chunk(2, dim=-1)
+        return self.fc2(F.silu(a) * b)
+
+
+# ============================================================
+# Rotary Positional Embeddings (RoPE)
+# ============================================================
+
+class RotaryPositionalEmbedding(nn.Module):
+    """
+    Cache cos/sin tables up to a maximum, and extend on demand.
+    """
+    def __init__(self, dim: int, base: float = 10000.0, max_seq_len: int = 2048):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError("RoPE head_dim must be even.")
+        self.dim = dim
+        self.base = float(base)
+        self._build_cache(max_seq_len)
+
+    def _build_cache(self, seq_len: int) -> None:
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
+        t = torch.arange(seq_len).float()
+        freqs = torch.einsum("i,j->ij", t, inv_freq)  # [T, Hd/2]
+        cos = freqs.cos()
+        sin = freqs.sin()
+        self.register_buffer("cos_cached", cos, persistent=False)
+        self.register_buffer("sin_cached", sin, persistent=False)
+
+    def forward(self, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if seq_len > self.cos_cached.shape[0]:
+            self._build_cache(seq_len)
+        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """
+    x: [B, H, T, Hd]
+    cos/sin: [T, Hd/2]
+    """
+    b, h, t, hd = x.shape
+    x_ = x.view(b, h, t, hd // 2, 2)
+    x1 = x_[..., 0]
+    x2 = x_[..., 1]
+    # rotate
+    out1 = x1 * cos - x2 * sin
+    out2 = x1 * sin + x2 * cos
+    out = torch.stack([out1, out2], dim=-1).view(b, h, t, hd)
+    return out
+
+
+# ============================================================
+# Factorized Embedding with tied logits
+# ============================================================
+
+class LowRankEmbedding(nn.Module):
+    """Factorized embedding equivalent to a full VxD matrix.
+
+    We parameterize the implicit embedding matrix as:
+        W_full = W_tok (V x r) @ W_mid (r x r) @ W_out (r x D)
+    where r = D // embed_factor.
+
+    If embed_factor == 1, use a normal full V x D embedding with tied logits.
+
+    Embedding lookup for embed_factor > 1:
+        emb(ids) = W_tok[ids] @ W_mid @ W_out    -> [B, T, D]
+    Embedding lookup for embed_factor == 1:
+        emb(ids) = W_tok[ids]                    -> [B, T, D]
+
+    Tied logits (no materialization of W_full):
+        logits(x) = x @ W_full^T
+    """
+
+    def __init__(
+        self, vocab_size: int, dim: int, n: int = 4, init_std: float = 0.02,
+        factorized_init: str = "variance_matched",
+    ):
+        super().__init__()
+        if n < 1:
+            raise ValueError("embed_factor must be >= 1")
+        if dim % n != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by embed_factor ({n})")
+        self.vocab_size = int(vocab_size)
+        self.dim = int(dim)
+        self.embed_factor = int(n)
+        if factorized_init not in ("variance_matched", "legacy"):
+            raise ValueError("factorized_init must be 'variance_matched' or 'legacy'")
+        self.factorized_init = factorized_init
+
+        r = dim // n
+        self.rank = r
+
+        self.tok = nn.Embedding(self.vocab_size, r)
+        self.use_mid = n > 1
+        if self.use_mid:
+            self.mid = nn.Parameter(torch.empty(r, r))
+            self.out = nn.Parameter(torch.empty(r, dim))
+        else:
+            self.register_parameter("mid", None)
+            self.register_parameter("out", None)
+
+        # init
+        nn.init.normal_(self.tok.weight, mean=0.0, std=init_std)
+        if self.use_mid:
+            if self.factorized_init == "legacy":
+                nn.init.normal_(self.mid, mean=0.0, std=init_std)
+                nn.init.normal_(self.out, mean=0.0, std=init_std)
+            else:
+                # W_tok @ I @ W_out has the same per-coordinate variance as
+                # a full embedding initialized with std=init_std.
+                nn.init.eye_(self.mid)
+                nn.init.normal_(self.out, mean=0.0, std=self.rank**-0.5)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        x = self.tok(input_ids)  # [B, T, r]
+        if self.use_mid:
+            x = x @ self.mid      # [B, T, r]
+            x = x @ self.out      # [B, T, D]
+        return x
+
+    def logits(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, D] -> [B, T, V]
+        if not self.use_mid:
+            return F.linear(x, self.tok.weight)
+        h = x @ self.out.t()               # [B, T, r]
+        h = h @ self.mid.t()               # [B, T, r]
+        return h @ self.tok.weight.t()     # [B, T, V]
+
+    def resize_vocab(self, new_vocab_size: int) -> None:
+        """
+        Resize only the token factor matrix W_tok (V x r).
+        W_mid and W_out are unaffected.
+        """
+        new_vocab_size = int(new_vocab_size)
+        if new_vocab_size == self.vocab_size:
+            return
+        if new_vocab_size <= 0:
+            raise ValueError("new_vocab_size must be > 0")
+
+        old_weight = self.tok.weight.data
+        new_tok = nn.Embedding(new_vocab_size, self.rank, device=old_weight.device, dtype=old_weight.dtype)
+        nn.init.normal_(new_tok.weight, mean=0.0, std=old_weight.std().item() if old_weight.numel() > 1 else 0.02)
+
+        n_copy = min(self.vocab_size, new_vocab_size)
+        new_tok.weight.data[:n_copy].copy_(old_weight[:n_copy])
+        self.tok = new_tok
+        self.vocab_size = new_vocab_size
+
+
+# ============================================================
+# Attention (bidirectional or causal)
+# ============================================================
+
+class SelfAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        rope: Optional[RotaryPositionalEmbedding] = None,
+        is_causal: bool = False,
+        use_sdpa: bool = True,
+    ):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError("dim must be divisible by num_heads")
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.rope = rope
+        self.is_causal = bool(is_causal)
+        self.use_sdpa = bool(use_sdpa)
+
+        self.q_proj = nn.Linear(dim, dim, bias=True)
+        self.k_proj = nn.Linear(dim, dim, bias=True)
+        self.v_proj = nn.Linear(dim, dim, bias=True)
+        self.out = nn.Linear(dim, dim, bias=True)
+
+    def _build_sdpa_mask(
+        self,
+        attention_mask: Optional[torch.Tensor],
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if attention_mask is None:
+            return None
+
+        # SDPA bool masks use True for positions that are allowed to attend.
+        mask = attention_mask.to(dtype=torch.bool, device=device).view(batch_size, 1, 1, seq_len)
+
+        if self.is_causal:
+            causal = torch.ones((seq_len, seq_len), device=device, dtype=torch.bool).tril().view(1, 1, seq_len, seq_len)
+            mask = mask & causal
+
+        return mask
+
+    def _manual_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        b, _, t, _ = q.shape
+        att = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # [B, H, T, T]
+
+        if self.is_causal:
+            causal = torch.tril(torch.ones((t, t), device=att.device, dtype=torch.bool))
+            att = att.masked_fill(~causal.view(1, 1, t, t), torch.finfo(att.dtype).min)
+
+        if attention_mask is not None:
+            key_mask = attention_mask.to(dtype=torch.bool, device=att.device).view(b, 1, 1, t)
+            att = att.masked_fill(~key_mask, torch.finfo(att.dtype).min)
+
+        att = F.softmax(att, dim=-1)
+        return torch.matmul(att, v)  # [B, H, T, Hd]
+
+    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        x: [B, T, D]
+        attention_mask (optional): [B, T] with 1 for valid tokens and 0 for padding.
+        """
+        b, t, d = x.shape
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = q.view(b, t, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, T, Hd]
+        k = k.view(b, t, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(b, t, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if self.rope is not None:
+            cos, sin = self.rope(t)
+            cos = cos.to(device=x.device, dtype=x.dtype)
+            sin = sin.to(device=x.device, dtype=x.dtype)
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
+
+        if self.use_sdpa and hasattr(F, "scaled_dot_product_attention"):
+            sdpa_mask = self._build_sdpa_mask(attention_mask, b, t, q.device)
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=sdpa_mask,
+                dropout_p=0.0,
+                is_causal=(self.is_causal and sdpa_mask is None),
+            )
+        else:
+            y = self._manual_attention(q, k, v, attention_mask)
+
+        y = y.transpose(1, 2).contiguous().view(b, t, d)
+        y = self.out(y)
+
+        if attention_mask is not None:
+            # Zero out padded query positions (optional but keeps activations bounded).
+            y = y * attention_mask.to(dtype=y.dtype, device=y.device).unsqueeze(-1)
+
+        return y
+
+
+# ============================================================
+# Core recursive blocks
+# ============================================================
+
+class RecursiveReasoningBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        expansion: float,
+        eps: float,
+        rope: Optional[RotaryPositionalEmbedding],
+        pre_norm: bool,
+        is_causal: bool,
+        use_sdpa: bool,
+    ):
+        super().__init__()
+        self.pre_norm = bool(pre_norm)
+        self.attn = SelfAttention(dim=dim, num_heads=num_heads, rope=rope, is_causal=is_causal, use_sdpa=use_sdpa)
+        self.ffn = SwiGLUFeedForward(dim=dim, expansion=expansion)
+
+        self.norm1 = RootMeanSquareNorm(dim, eps=eps)
+        self.norm2 = RootMeanSquareNorm(dim, eps=eps)
+
+    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.pre_norm:
+            x = x + self.attn(self.norm1(x), attention_mask=attention_mask)
+            x = x + self.ffn(self.norm2(x))
+        else:
+            x = self.norm1(x + self.attn(x, attention_mask=attention_mask))
+            x = self.norm2(x + self.ffn(x))
+        return x
+
+
+class SharedReasoningStack(nn.Module):
+    """
+    Shared update operator: inject conditioning, then apply blocks.
+    """
+    def __init__(self, blocks: nn.ModuleList):
+        super().__init__()
+        self.blocks = blocks
+
+    def forward(self, z: torch.Tensor, inject: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        z = z + inject
+        for blk in self.blocks:
+            z = blk(z, attention_mask=attention_mask)
+        return z
+
+
+# ============================================================
+# Hugging Face config + models
+# ============================================================
+
+class RecursiveRefinerConfig(PretrainedConfig):
+    model_type = "recursive_refiner"
+
+    def __init__(
+        self,
+        vocab_size: int = 50000,
+        max_position_embeddings: int = 512,
+        hidden_size: int = 256,
+        num_attention_heads: int = 8,
+        num_hidden_layers: int = 2,
+        expansion: float = 4.0,
+        recurrence_mode: str = "nested",
+        flat_cycles: int = 8,
+        hi_cycles: int = 3,
+        lo_cycles: int = 2,
+        grad_last_cycle_only: bool = False,
+        halt_on_train: bool = False,
+        halt_on_eval: bool = False,
+        halt_min_cycles: int = 1,
+        halt_threshold: float = 0.0,
+        halt_per_sample: bool = True,
+        halt_batch_reduction: str = "max",
+        halt_epsilon: float = 1e-6,
+        embed_factor: int = 4,
+        factorized_init: str = "variance_matched",
+        pre_norm: bool = True,
+        rope_theta: float = 10000.0,
+        rms_eps: float = 1e-5,
+        prefix_len: int = 0,
+        is_causal: bool = False,
+        pad_token_id: int = 0,
+        bos_token_id: int = 1,
+        eos_token_id: int = 2,
+        use_cache: bool = False,
+        # Downstream / fine-tuning helpers.
+        classifier_dropout: float = 0.1,
+        pooler_type: str = "cls",
+        use_sdpa: bool = True,
+        **kwargs,
+    ):
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            use_cache=use_cache,
+            **kwargs,
+        )
+        self.vocab_size = int(vocab_size)
+        self.max_position_embeddings = int(max_position_embeddings)
+        self.hidden_size = int(hidden_size)
+        self.num_attention_heads = int(num_attention_heads)
+        self.num_hidden_layers = int(num_hidden_layers)
+        self.expansion = float(expansion)
+        self.recurrence_mode = str(recurrence_mode).lower()
+        if self.recurrence_mode not in ("nested", "flat", "flat_untied"):
+            raise ValueError("recurrence_mode must be 'nested', 'flat', or 'flat_untied'.")
+        self.flat_cycles = int(max(1, flat_cycles))
+        self.hi_cycles = int(hi_cycles)
+        self.lo_cycles = int(lo_cycles)
+        self.grad_last_cycle_only = bool(grad_last_cycle_only)
+        self.halt_on_train = bool(halt_on_train)
+        self.halt_on_eval = bool(halt_on_eval)
+        self.halt_min_cycles = int(max(1, halt_min_cycles))
+        self.halt_threshold = float(halt_threshold)
+        self.halt_per_sample = bool(halt_per_sample)
+        self.halt_batch_reduction = str(halt_batch_reduction)
+        if self.halt_batch_reduction not in ("max", "mean"):
+            raise ValueError("halt_batch_reduction must be 'max' or 'mean'.")
+        self.halt_epsilon = float(halt_epsilon)
+        self.embed_factor = int(embed_factor)
+        self.factorized_init = str(factorized_init)
+        if self.factorized_init not in ("variance_matched", "legacy"):
+            raise ValueError("factorized_init must be 'variance_matched' or 'legacy'.")
+        self.pre_norm = bool(pre_norm)
+        self.rope_theta = float(rope_theta)
+        self.rms_eps = float(rms_eps)
+        self.prefix_len = int(prefix_len)
+        self.is_causal = bool(is_causal)
+
+        # Fine-tuning helpers.
+        self.classifier_dropout = float(classifier_dropout)
+        self.pooler_type = str(pooler_type)
+        self.use_sdpa = bool(use_sdpa)
+
+        # HF flags: useful for generation utilities.
+        # For causal LM heads we will set is_decoder=True externally.
+        if "is_decoder" not in kwargs:
+            self.is_decoder = bool(is_causal)
+        if "tie_word_embeddings" not in kwargs:
+            # Our logits are tied by construction (via LowRankEmbedding.logits)
+            self.tie_word_embeddings = True
+
+
+class RecursiveRefinerPreTrainedModel(PreTrainedModel):
+    config_class = RecursiveRefinerConfig
+    base_model_prefix = "recursive_refiner"
+    supports_gradient_checkpointing = False
+
+    def _init_weights(self, module: nn.Module) -> None:
+        # Conservative init compatible with most Transformer-style training.
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+
+class RecursiveRefinerModel(RecursiveRefinerPreTrainedModel):
+    """
+    Base model: returns last_hidden_state (z_out) over token positions (prefix removed).
+    """
+
+    def __init__(self, config: RecursiveRefinerConfig):
+        super().__init__(config)
+        cfg = config
+
+        self.embed = LowRankEmbedding(
+            cfg.vocab_size, cfg.hidden_size, n=cfg.embed_factor, factorized_init=cfg.factorized_init
+        )
+
+        # Precompute RoPE cache up to maximum runtime length (prefix included).
+        max_len = cfg.max_position_embeddings + cfg.prefix_len
+        rope = RotaryPositionalEmbedding(dim=cfg.hidden_size // cfg.num_attention_heads, base=cfg.rope_theta, max_seq_len=max_len)
+
+        block_count = cfg.num_hidden_layers
+        if cfg.recurrence_mode == "flat_untied":
+            block_count *= cfg.flat_cycles
+
+        blocks = nn.ModuleList([
+            RecursiveReasoningBlock(
+                dim=cfg.hidden_size,
+                num_heads=cfg.num_attention_heads,
+                expansion=cfg.expansion,
+                eps=cfg.rms_eps,
+                rope=rope,
+                pre_norm=cfg.pre_norm,
+                is_causal=cfg.is_causal,
+                use_sdpa=cfg.use_sdpa,
+            )
+            for _ in range(block_count)
+        ])
+        if cfg.recurrence_mode == "flat_untied":
+            self.flat_untied_blocks = blocks
+        else:
+            self.shared = SharedReasoningStack(blocks)
+
+        if cfg.recurrence_mode in ("flat", "flat_untied"):
+            self.flat_init = nn.Parameter(torch.randn(cfg.hidden_size) * 0.02)
+        else:
+            self.hi_init = nn.Parameter(torch.randn(cfg.hidden_size) * 0.02)
+            self.lo_init = nn.Parameter(torch.randn(cfg.hidden_size) * 0.02)
+
+        if cfg.prefix_len > 0:
+            self.prefix = nn.Parameter(torch.randn(cfg.prefix_len, cfg.hidden_size) * 0.02)
+        else:
+            self.prefix = None
+
+        self.post_init()
+
+    def init_latents(self, batch_size: int, total_len: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.config.recurrence_mode != "nested":
+            raise RuntimeError("Nested high/low latents are only available in nested recurrence mode.")
+        z_hi = self.hi_init.to(device=device, dtype=dtype).view(1, 1, -1).expand(batch_size, total_len, -1).contiguous()
+        z_lo = self.lo_init.to(device=device, dtype=dtype).view(1, 1, -1).expand(batch_size, total_len, -1).contiguous()
+        return z_hi, z_lo
+
+    def _halt_enabled(self, use_training_halt: Optional[bool]) -> bool:
+        if self.config.halt_threshold <= 0:
+            return False
+        if use_training_halt is None:
+            use_training_halt = torch.is_grad_enabled()
+        return self.config.halt_on_train if use_training_halt else self.config.halt_on_eval
+
+    def _refine_h_cycle(
+        self,
+        z_hi: torch.Tensor,
+        z_lo: torch.Tensor,
+        input_embeddings: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        lo_cycles: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        for _ in range(lo_cycles):
+            z_lo = self.shared(z_lo, inject=(z_hi + input_embeddings), attention_mask=attention_mask)
+        z_hi = self.shared(z_hi, inject=z_lo, attention_mask=attention_mask)
+        return z_hi, z_lo
+
+    def _relative_h_delta(
+        self,
+        prev_z_hi: torch.Tensor,
+        z_hi: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        diff = z_hi - prev_z_hi
+        if attention_mask is not None:
+            mask = attention_mask.to(device=z_hi.device, dtype=z_hi.dtype).unsqueeze(-1)
+            diff_sq = diff.pow(2).mul(mask).sum(dim=(1, 2))
+            state_sq = z_hi.pow(2).mul(mask).sum(dim=(1, 2))
+        else:
+            diff_sq = diff.pow(2).sum(dim=(1, 2))
+            state_sq = z_hi.pow(2).sum(dim=(1, 2))
+
+        eps = max(float(self.config.halt_epsilon), torch.finfo(z_hi.dtype).eps)
+        return (diff_sq / state_sq.clamp_min(eps)).sqrt()
+
+    def _refine_active_h_cycle(
+        self,
+        z_hi: torch.Tensor,
+        z_lo: torch.Tensor,
+        input_embeddings: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        lo_cycles: int,
+        active_mask: Optional[torch.Tensor],
+        compute_delta: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if active_mask is None:
+            prev_z_hi = z_hi if compute_delta else None
+            z_hi, z_lo = self._refine_h_cycle(z_hi, z_lo, input_embeddings, attention_mask, lo_cycles)
+            h_delta = self._relative_h_delta(prev_z_hi, z_hi, attention_mask) if compute_delta else None
+            return z_hi, z_lo, h_delta, None
+
+        active_indices = active_mask.nonzero(as_tuple=False).flatten()
+        if active_indices.numel() == 0:
+            return z_hi, z_lo, None, active_indices
+
+        active_z_hi = z_hi.index_select(0, active_indices)
+        active_z_lo = z_lo.index_select(0, active_indices)
+        active_input = input_embeddings.index_select(0, active_indices)
+        active_attention_mask = attention_mask.index_select(0, active_indices) if attention_mask is not None else None
+
+        new_active_z_hi, new_active_z_lo = self._refine_h_cycle(
+            active_z_hi,
+            active_z_lo,
+            active_input,
+            active_attention_mask,
+            lo_cycles,
+        )
+        h_delta = self._relative_h_delta(active_z_hi, new_active_z_hi, active_attention_mask) if compute_delta else None
+
+        z_hi = z_hi.index_copy(0, active_indices, new_active_z_hi)
+        z_lo = z_lo.index_copy(0, active_indices, new_active_z_lo)
+        return z_hi, z_lo, h_delta, active_indices
+
+    def _should_halt(self, h_delta: torch.Tensor) -> bool:
+        if self.config.halt_batch_reduction == "mean":
+            halt_value = h_delta.mean()
+        else:
+            halt_value = h_delta.max()
+        return bool((halt_value <= self.config.halt_threshold).detach().item())
+
+    def _halted_samples(self, h_delta: torch.Tensor) -> torch.Tensor:
+        return (h_delta <= self.config.halt_threshold).detach()
+
+    def _any_active(self, active_mask: Optional[torch.Tensor]) -> bool:
+        return active_mask is None or bool(active_mask.any().detach().item())
+
+    def _update_active_mask(
+        self,
+        active_mask: Optional[torch.Tensor],
+        active_indices: Optional[torch.Tensor],
+        h_delta: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], bool]:
+        if h_delta is None:
+            return active_mask, True
+        if active_mask is None:
+            return active_mask, self._should_halt(h_delta)
+
+        halted_now = self._halted_samples(h_delta)
+        if bool(halted_now.any().detach().item()):
+            active_mask = active_mask.clone()
+            active_mask[active_indices[halted_now]] = False
+        return active_mask, not self._any_active(active_mask)
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed
+
+    def set_input_embeddings(self, value: nn.Module) -> None:
+        if not isinstance(value, LowRankEmbedding):
+            raise TypeError("RecursiveRefinerModel expects a LowRankEmbedding.")
+        self.embed = value
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        output_hidden_states: Optional[bool] = None,
+        use_training_halt: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[BaseModelOutput, Tuple[torch.Tensor]]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else False
+
+        if input_ids.dim() != 2:
+            raise ValueError(f"input_ids must be [B, L], got {tuple(input_ids.shape)}")
+        b, l = input_ids.shape
+
+        if attention_mask is not None and attention_mask.shape != (b, l):
+            raise ValueError(f"attention_mask must have shape {(b, l)}, got {tuple(attention_mask.shape)}")
+
+        x = self.embed(input_ids)  # [B, L, D]
+
+        if self.config.prefix_len > 0:
+            prefix = self.prefix.unsqueeze(0).expand(b, -1, -1)  # [B, P, D]
+            x = torch.cat([prefix, x], dim=1)  # [B, P+L, D]
+            if attention_mask is not None:
+                prefix_mask = torch.ones(b, self.config.prefix_len, device=attention_mask.device, dtype=attention_mask.dtype)
+                attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)  # [B, P+L]
+
+        if self.config.recurrence_mode in ("flat", "flat_untied"):
+            hidden_history = [] if output_hidden_states else None
+            # A single learned state receives the token embeddings on every pass.
+            flat_init = self.flat_init.to(device=x.device, dtype=x.dtype)
+            z = flat_init.view(1, 1, -1).expand(b, x.shape[1], -1).contiguous()
+            for cycle_idx in range(self.config.flat_cycles):
+                if self.config.recurrence_mode == "flat":
+                    z = self.shared(z, inject=x, attention_mask=attention_mask)
+                else:
+                    # Match flat shared recurrence: inject embeddings once before
+                    # each pass through the two-layer RR stack.
+                    z = z + x
+                    first_block = cycle_idx * self.config.num_hidden_layers
+                    for layer_idx in range(self.config.num_hidden_layers):
+                        block = self.flat_untied_blocks[first_block + layer_idx]
+                        z = block(z, attention_mask=attention_mask)
+                if hidden_history is not None:
+                    hidden_history.append(z[:, self.config.prefix_len :])
+            z_final = z
+            z_out = z_final[:, self.config.prefix_len:]  # [B, L, D] (prefix removed)
+            if not return_dict:
+                return (z_out,)
+            return BaseModelOutput(
+                last_hidden_state=z_out,
+                hidden_states=tuple(hidden_history) if hidden_history is not None else None,
+                attentions=None,
+            )
+
+        total_len = x.shape[1]
+        z_hi, z_lo = self.init_latents(b, total_len=total_len, device=x.device, dtype=x.dtype)
+
+        hi_cycles = int(max(1, self.config.hi_cycles))
+        lo_cycles = int(max(1, self.config.lo_cycles))
+        halt_enabled = self._halt_enabled(use_training_halt)
+        halt_min_cycles = int(max(1, self.config.halt_min_cycles))
+        halt_per_sample = bool(halt_enabled and self.config.halt_per_sample)
+        active_mask = torch.ones(b, device=x.device, dtype=torch.bool) if halt_per_sample else None
+        hidden_history = [] if output_hidden_states else None
+        completed_hi_cycles = 0
+        batch_halted = False
+
+        grad_last_cycle_only = bool(self.config.grad_last_cycle_only and (use_training_halt if use_training_halt is not None else torch.is_grad_enabled()))
+        if grad_last_cycle_only:
+            with torch.no_grad():
+                for _ in range(hi_cycles - 1):
+                    if batch_halted or not self._any_active(active_mask):
+                        break
+                    z_hi, z_lo, h_delta, active_indices = self._refine_active_h_cycle(
+                        z_hi,
+                        z_lo,
+                        x,
+                        attention_mask,
+                        lo_cycles,
+                        active_mask,
+                        halt_enabled and completed_hi_cycles + 1 >= halt_min_cycles,
+                    )
+                    completed_hi_cycles += 1
+                    if hidden_history is not None:
+                        hidden_history.append(z_hi[:, self.config.prefix_len :])
+                    if halt_enabled and completed_hi_cycles >= halt_min_cycles:
+                        active_mask, batch_halted = self._update_active_mask(active_mask, active_indices, h_delta)
+                    if batch_halted:
+                        break
+
+        grad_cycles = 1 if grad_last_cycle_only else hi_cycles
+        for _ in range(grad_cycles):
+            if batch_halted and not grad_last_cycle_only:
+                break
+            if not grad_last_cycle_only and not self._any_active(active_mask):
+                break
+
+            # With last-cycle-only gradients, always run one final full-batch
+            # differentiable cycle so every sample contributes to the loss.
+            cycle_active_mask = None if grad_last_cycle_only else active_mask
+            z_hi, z_lo, h_delta, active_indices = self._refine_active_h_cycle(
+                z_hi,
+                z_lo,
+                x,
+                attention_mask,
+                lo_cycles,
+                cycle_active_mask,
+                halt_enabled and completed_hi_cycles + 1 >= halt_min_cycles,
+            )
+            completed_hi_cycles += 1
+            if hidden_history is not None:
+                hidden_history.append(z_hi[:, self.config.prefix_len :])
+            if grad_last_cycle_only:
+                continue
+            if halt_enabled and completed_hi_cycles >= halt_min_cycles:
+                active_mask, batch_halted = self._update_active_mask(active_mask, active_indices, h_delta)
+            if batch_halted:
+                break
+
+        z_final = z_hi
+        z_out = z_final[:, self.config.prefix_len:]  # [B, L, D] (prefix removed)
+
+        if not return_dict:
+            return (z_out,)
+        return BaseModelOutput(
+            last_hidden_state=z_out,
+            hidden_states=tuple(hidden_history) if hidden_history is not None else None,
+            attentions=None,
+        )
+
+
+class RecursiveRefinerForMaskedLM(RecursiveRefinerPreTrainedModel):
+    """
+    MLM head (bidirectional attention). Use DataCollatorForLanguageModeling(mlm=True).
+    """
+    def __init__(self, config: RecursiveRefinerConfig):
+        # Ensure MLM uses bidirectional attention
+        config.is_causal = False
+        config.is_decoder = False
+        super().__init__(config)
+        self.recursive_refiner = RecursiveRefinerModel(config)
+        self.post_init()
+
+    def get_output_embeddings(self) -> Optional[nn.Module]:
+        # logits are tied via LowRankEmbedding; there is no separate head module.
+        return None
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[MaskedLMOutput, Tuple[torch.Tensor]]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.recursive_refiner(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=output_hidden_states,
+            use_training_halt=labels is not None and torch.is_grad_enabled(),
+            return_dict=True,
+        )
+        z_out = outputs.last_hidden_state
+        logits = self.recursive_refiner.embed.logits(z_out)
+
+        loss = None
+        if labels is not None:
+            if attention_mask is not None:
+                # Safety: ignore padding positions even if labels were not masked to -100.
+                labels = labels.masked_fill(attention_mask == 0, -100)
+
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+            loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+
+        if not return_dict:
+            out = (logits, z_out)
+            return ((loss,) + out) if loss is not None else out
+
+        return MaskedLMOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=None,
+        )
+
+
+class RecursiveRefinerForCausalLM(RecursiveRefinerPreTrainedModel):
+    """
+    Autoregressive (causal) LM head. Use DataCollatorForLanguageModeling(mlm=False).
+    The shifting for next-token prediction is done inside forward().
+    """
+    def __init__(self, config: RecursiveRefinerConfig):
+        config.is_causal = True
+        config.is_decoder = True
+        super().__init__(config)
+        self.recursive_refiner = RecursiveRefinerModel(config)
+        self.post_init()
+
+    def get_output_embeddings(self) -> Optional[nn.Module]:
+        return None
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        # No KV cache implemented; generate() will repeatedly call forward on full sequences.
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[CausalLMOutputWithPast, Tuple[torch.Tensor]]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.recursive_refiner(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_training_halt=labels is not None and torch.is_grad_enabled(),
+            return_dict=True,
+        )
+        z_out = outputs.last_hidden_state
+        logits = self.recursive_refiner.embed.logits(z_out)
+
+        loss = None
+        if labels is not None:
+            # Ensure padding is ignored.
+            if attention_mask is not None:
+                labels = labels.masked_fill(attention_mask == 0, -100)
+
+            # Shift for next-token prediction:
+            # Predict token t+1 from positions <= t.
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+
+        if not return_dict:
+            out = (logits, z_out)
+            return ((loss,) + out) if loss is not None else out
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=None,
+            hidden_states=outputs.hidden_states,
+            attentions=None,
+        )
+
+
+class RecursiveRefinerForSequenceClassification(RecursiveRefinerPreTrainedModel):
+    """Sequence classification head for downstream fine-tuning.
+
+    This is intentionally lightweight and compatible with Cramming's training loop,
+    which expects the forward pass to return an object supporting ``["loss"]`` and
+    ``["logits"]`` access (HF ModelOutput objects satisfy this).
+
+    Pooling:
+      * ``pooler_type=\"cls\"`` (default): use first token embedding.
+      * ``pooler_type=\"mean\"``: masked mean-pooling over sequence length.
+    """
+
+    def __init__(self, config: RecursiveRefinerConfig):
+        # Classification is typically done with bidirectional attention, but we do
+        # not forcibly override config.is_causal to allow experimentation.
+        config.is_decoder = False
+        super().__init__(config)
+        self.num_labels = int(getattr(config, "num_labels", 2))
+
+        self.recursive_refiner = RecursiveRefinerModel(config)
+        p = float(getattr(config, "classifier_dropout", 0.1))
+        self.dropout = nn.Dropout(p)
+        self.classifier = nn.Linear(config.hidden_size, self.num_labels)
+
+        self.problem_type = None
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[SequenceClassifierOutput, Tuple[torch.Tensor]]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.recursive_refiner(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_training_halt=labels is not None and torch.is_grad_enabled(),
+            return_dict=True,
+        )
+        z_out = outputs.last_hidden_state  # [B, L, D]
+
+        pooler_type = str(getattr(self.config, "pooler_type", "cls")).lower()
+        if pooler_type == "mean":
+            if attention_mask is None:
+                pooled = z_out.mean(dim=1)
+            else:
+                mask = attention_mask.to(dtype=z_out.dtype, device=z_out.device).unsqueeze(-1)  # [B, L, 1]
+                denom = mask.sum(dim=1).clamp(min=1.0)
+                pooled = (z_out * mask).sum(dim=1) / denom
+        else:  # "cls" or any unknown value
+            pooled = z_out[:, 0]
+
+        logits = self.classifier(self.dropout(pooled))
+
+        loss = None
+        if labels is not None:
+            # Mirror the widely-used HF/BERT logic.
+            if self.problem_type is None:
+                if self.num_labels == 1:
+                    self.problem_type = "regression"
+                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+                    self.problem_type = "single_label_classification"
+                else:
+                    self.problem_type = "multi_label_classification"
+
+            if self.problem_type == "regression":
+                loss_fct = nn.MSELoss()
+                loss = loss_fct(logits.squeeze(), labels.squeeze())
+            elif self.problem_type == "single_label_classification":
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            else:  # multi-label
+                loss_fct = nn.BCEWithLogitsLoss()
+                loss = loss_fct(logits, labels)
+        else:
+            # Cramming expects a tensor-valued loss even when labels are absent.
+            loss = logits.new_zeros((1,))
+
+        if not return_dict:
+            return (loss, logits)
+
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=None,
+        )

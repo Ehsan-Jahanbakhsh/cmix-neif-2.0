@@ -3,6 +3,7 @@
 #ifndef SELF_EXTRACT_H
 #define SELF_EXTRACT_H
 #include "../meld.h"
+#include "../byte_weights.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -155,7 +156,7 @@ int selfextract_comp() {
   fclose(fo);
 
   if (weights_len) {
-    fo = fx_open("weights-poc8m_w2048_tf2t3_pruned_v5k_np2.c5", "wb");
+    fo = fx_open(CMIX_BYTE_WEIGHTS, "wb");
     fwrite(p1 + decmpressor_binary_size + header.dict_size
               + header.new_article_order_size, weights_len, 1, fo);
     fclose(fo);
@@ -221,7 +222,7 @@ int selfextract_decomp() {
   if (weights_len &&
       helper_process::BlockAusAbbild(f,
           (long)(decmpressor_binary_size + dict_block_size),
-          weights_len, "weights-poc8m_w2048_tf2t3_pruned_v5k_np2.c5") != 0) {
+          weights_len, CMIX_BYTE_WEIGHTS) != 0) {
     msg_note(168);
     return 1;
   }

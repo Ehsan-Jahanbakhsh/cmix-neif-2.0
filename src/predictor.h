@@ -72,6 +72,9 @@ class Predictor {
   int bitl_override_ = 0;
   bool AdepthSkipped() const { return adepth_.skip; }
   int Tf1ZwangByte() const { return tf1_engine_ ? tf1_engine_->ZwangByte() : -1; }
+  const std::valarray<float>* LiveByteRow() {
+    return tf1_slot_->KtxLive() ? &tf1_slot_->BytePredict() : nullptr;
+  }
   void WordlblBlockEnde() { wordlbl_ = word_label::Neu(wordlbl_); }
   void MetalrBlockEnde();
   void PpmdWaermen();

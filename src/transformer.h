@@ -3,6 +3,7 @@
 
 
 #include "author_block.h"
+#include "byte_weights.h"
 
 // The pre-trained transformer in the byte mixer.
 //
@@ -151,7 +152,7 @@ inline void SetBlobForm() { BlobForm() = true; }
 // the blob form (the self-invocations with -C/-D, which code the appended data
 // blocks without the transformer) and the auxiliary-stream flag below; nothing
 // is read from the environment.
-inline const char* WeightsPath() { return "weights-poc8m_w2048_tf2t3_pruned_v5k_np2.c5"; }
+inline const char* WeightsPath() { return CMIX_BYTE_WEIGHTS; }
 inline unsigned long long WeightsFingerprint() {
   return 0xaec368ac6a568632ULL;
 }

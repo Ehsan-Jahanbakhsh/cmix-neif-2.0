@@ -1,0 +1,42 @@
+#pragma once
+
+#include <cstdio>
+#include <vector>
+
+namespace rr {
+
+// Streaming equivalent of the nested, pre-norm causal RecursiveRefinerModel.
+// Weights are shared across cycles. Each invocation needs its own KV history.
+class Model {
+ public:
+  explicit Model(const char* path);
+  void begin_article() { position_ = 0; }
+  void step(unsigned token, float* probabilities, bool read = true);
+  const float* last_hidden() const { return high_.data(); }
+  const float* last_key() const { return low_.data(); }
+  static constexpr int hidden_size() { return 192; }  // cmix feature width
+
+ private:
+  using Row = std::vector<float>;
+  struct Linear {
+    Row weight, bias;
+    void apply(const Row& input, Row& output) const;
+  };
+  struct Block {
+    Row norm1, norm2;
+    Linear q, k, v, out, fc1, fc2;
+  };
+  struct Cache { Row keys, values; };
+  void update(Row& state, const Row& injection, int& pass);
+  void attend(const Block& block, Cache& cache, Row& state);
+  void rotate(Row& row) const;
+
+  int width_, heads_, inner_, high_cycles_, low_cycles_, context_;
+  int position_ = 0;
+  Row embeddings_, high_init_, low_init_, cos_, sin_;
+  std::vector<Block> blocks_;
+  std::vector<Cache> caches_;
+  Row high_, low_, injection_, norm_, q_, k_, v_, attended_, projected_, gates_, ff_, scores_;
+};
+
+}  // namespace rr

@@ -5,9 +5,7 @@
 # What this script does NOT do -- every line is checkable:
 #   * no apt, no network, no downloads: everything comes from install.sh
 #   * no root, no sudo
-#   * it reads nothing from the environment and exports nothing: the build
-#     itself is started with "env -i", so the compiler cannot see an
-#     inherited variable either
+#   * the build receives the selected byte model in a clean environment
 #   * the build runs in a copy (.build/ in the working directory); the only
 #     file it leaves behind is the compressor, in the working directory
 #   * it may be started from any directory, the unpacked source directory
@@ -17,6 +15,14 @@ set -eu
 SOURCE="$(cd "$(dirname "$0")" && pwd)"      # this package, read-only is fine
 TARGET="$(pwd -P)"                           # working directory, writable
 WORK="$TARGET/.build"
+BYTE_MODEL="${BYTE_MODEL:-refiner}"
+case "$BYTE_MODEL" in
+  transformer) ;;
+  refiner)
+    RR_SOURCE="$(realpath "${REFINER_WEIGHTS:-$SOURCE/recursive-refiner.rrb}")"
+    [ -s "$RR_SOURCE" ] || { echo "Export the refiner checkpoint first." >&2; exit 1; } ;;
+  *) echo "BYTE_MODEL must be transformer or refiner" >&2; exit 1 ;;
+esac
 
 [ -w "$TARGET" ] || { echo "build.sh: $TARGET is not writable." >&2; exit 1; }
 
@@ -41,13 +47,15 @@ mkdir -p "$WORK" "$WORK/tmp"
 # tar, not "cp -a": started from inside the source directory (the way the
 # README shows it), .build/ lies inside SOURCE, and cp refuses to copy a
 # directory into itself.
-(cd "$SOURCE" && tar cf - --exclude=./.build --exclude=./comp9 .) \
+(cd "$SOURCE" && tar cf - --exclude=./.git --exclude=./.build --exclude=./build-refiner --exclude=./comp9 .) \
   | (cd "$WORK" && tar xf -)
 chmod -R u+w "$WORK"
 rm -f "$WORK/install.sh" "$WORK/build.sh"    # they have no part in the build
 
 cd "$WORK"
+if [ "$BYTE_MODEL" = refiner ]; then cp "$RR_SOURCE" recursive-refiner.rrb; fi
 env -i \
+    BYTE_MODEL="$BYTE_MODEL" \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     HOME="$WORK" TMPDIR="$WORK/tmp" LC_ALL=C LANG=C TZ=UTC \
     /bin/bash ./build_and_construct_comp.sh

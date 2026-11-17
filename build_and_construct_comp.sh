@@ -10,6 +10,11 @@ CFLAGS_DEFINES="-DSEED=$SEED -DUPDATE_LIMIT=$UPDATE_LIMIT"
 
 # The weight container that gets embedded as the fourth block.
 WEIGHTS_FILE="weights-poc8m_w2048_tf2t3_pruned_v5k_np2.c5"
+export BYTE_MODEL="${BYTE_MODEL:-refiner}"
+if [[ "$BYTE_MODEL" == "refiner" ]]; then
+  WEIGHTS_FILE="recursive-refiner.rrb"
+  [[ -s "$WEIGHTS_FILE" ]] || { echo "Export $WEIGHTS_FILE before packaging." >&2; exit 1; }
+fi
 
 # ---------------------------------------------------------------------------
 # Packaging.  There are no options: the toolchain, the section stripping and
