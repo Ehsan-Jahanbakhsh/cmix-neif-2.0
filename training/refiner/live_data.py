@@ -11,7 +11,6 @@ import sys
 import tempfile
 
 BASE = "35d1957a5074db802fc134126afc77b76d931761"
-ROOT = Path(__file__).resolve().parents[2]
 ENWIK9 = "159b85351e5f76e60cbe32e04c677847a9ecba3adc79addab6f4c6c7aa3744bc"
 ENWIK8 = "2b49720ec4d78c3c9fabaee6e4179a5e997302b3a70029f30f2d582218c024a8"
 FILES = {
@@ -27,10 +26,12 @@ def verify(path, expected):
             raise ValueError(f"upstream checksum mismatch for {path}")
 
 
-def build_identity(binary, dataset):
+def build_identity(binary, dataset, patch_sha256=None):
     result = dict(dataset=dataset, producer=hashlib.sha256(binary.read_bytes()).hexdigest())
     if dataset == "enwik9":
-        result["patch"] = hashlib.sha256(Path(__file__).with_name("live_rows.patch").read_bytes()).hexdigest()
+        if patch_sha256 is None:
+            patch_sha256 = hashlib.sha256(Path(__file__).with_name("live_rows.patch").read_bytes()).hexdigest()
+        result["patch"] = patch_sha256
     return result
 
 
@@ -47,7 +48,8 @@ def prepare(args):
         paths = ["src", "makefile", "encoder_split.lds", "runtime_exports.map",
                  "training/tf/1_dump", "dictionary/english.dic"]
         archive = stage / "source.tar"
-        subprocess.run(["git", "-C", ROOT, "archive", "-o", archive, BASE, *paths], check=True)
+        root = Path(__file__).resolve().parents[2]
+        subprocess.run(["git", "-C", root, "archive", "-o", archive, BASE, *paths], check=True)
         subprocess.run(["tar", "xf", archive, "-C", src], check=True)
         build = src / "training/tf/1_dump"
         tools = stage / "tools"
@@ -105,9 +107,9 @@ def prepare_enwik8(args):
     print(f"Prepared verified enwik8 in {out}")
 
 
-def replay(work, dataset):
+def replay(work, dataset, patch_sha256=None):
     work = work.resolve()
-    if json.loads((work/"build.json").read_text()) != build_identity(work/"cmix_live", dataset):
+    if json.loads((work/"build.json").read_text()) != build_identity(work/"cmix_live", dataset, patch_sha256):
         raise ValueError("dataset, row producer or source patch differs from the prepared build")
     for name, sha in (FILES if dataset == "enwik9" else {"enwik8": ENWIK8}).items():
         verify(work/name, sha)
@@ -165,10 +167,11 @@ if __name__ == "__main__":
     run = commands.add_parser("replay")
     run.add_argument("work", type=Path)
     run.add_argument("--dataset", choices=("enwik8", "enwik9"), default="enwik9")
+    run.add_argument("--patch-sha256", help="enwik9 source patch digest supplied by the Windows trainer")
     args = p.parse_args()
     if args.command == "prepare":
         prepare(args)
     elif args.command == "prepare-enwik8":
         prepare_enwik8(args)
     else:
-        replay(args.work, args.dataset)
+        replay(args.work, args.dataset, args.patch_sha256)

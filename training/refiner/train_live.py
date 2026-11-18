@@ -5,9 +5,8 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
-import sys
 from tempfile import NamedTemporaryFile
 
 from filelock import FileLock
@@ -28,15 +27,32 @@ def source(args):
         with args.rows_file.open("rb") as f:
             yield f
         return
-    cmd = ["python3", "training/refiner/live_data.py", "replay", args.work, "--dataset", args.dataset]
+    producer = Path(__file__).with_name("live_data.py").resolve()
+    replay = ["replay", args.work, "--dataset", args.dataset]
     if args.wsl:
-        cmd = ["wsl.exe", "-d", args.wsl, "--exec", *cmd]
-    with (args.run_dir/"producer.log").open("ab") as log:
-        child = subprocess.Popen(cmd, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=log)
+        # The Windows repo drive can disappear from WSL between epochs. Feed the
+        # script over stdin and use only Linux paths for an absolute work directory.
+        cwd = "/" if PurePosixPath(args.work).is_absolute() else str(ROOT)
+        cmd = ["wsl.exe", "-d", args.wsl, "--cd", cwd, "--exec", "python3", "-", *replay]
+        if args.dataset == "enwik9":
+            patch = producer.with_name("live_rows.patch")
+            cmd.extend(["--patch-sha256", hashlib.sha256(patch.read_bytes()).hexdigest()])
+    else:
+        cmd = ["python3", str(producer), *replay]
+    with producer.open("rb") as script, (args.run_dir/"producer.log").open("a+b") as log:
+        log_start = log.tell()
+        child = subprocess.Popen(cmd, cwd=ROOT, stdin=script if args.wsl else subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=log)
         try:
-            yield child.stdout
-            if child.wait():
-                raise RuntimeError(f"producer failed, see {log.name}")
+            has_output = bool(child.stdout.peek(1))
+            if has_output:
+                yield child.stdout
+            code = child.wait()
+            if code or not has_output:
+                end = log.seek(0, os.SEEK_END)
+                log.seek(max(log_start, end - 2048))
+                detail = log.read().decode(errors="replace").strip() or "empty row stream"
+                raise RuntimeError(f"row producer exited with status {code}: {detail} (see {log.name})")
         finally:
             child.stdout.close()
             if child.poll() is None:

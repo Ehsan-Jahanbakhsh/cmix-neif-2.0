@@ -1,7 +1,11 @@
 """Regression checks for the live row reader and training restart."""
 import argparse
+import hashlib
 import io
+import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -28,6 +32,33 @@ def fixture(lengths):
 
 
 class LiveTrainingTest(unittest.TestCase):
+    def test_wsl_replay_without_repository_mount(self):
+        # Stand in for wsl.exe by running the delivered script in an empty cwd.
+        popen = subprocess.Popen
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root/"data"
+            work.mkdir()
+            binary = work/"cmix_live"
+            binary.write_bytes(b"test")
+            digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+            patch_sha = hashlib.sha256(Path(live.__file__).with_name("live_rows.patch").read_bytes()).hexdigest()
+            (work/"build.json").write_text(json.dumps(dict(dataset="enwik9", producer=digest, patch=patch_sha)))
+            args = argparse.Namespace(wsl="Ubuntu", dataset="enwik9", work="/dataset", rows_file=None, run_dir=root)
+
+            def launch(cmd, **kwargs):
+                self.assertEqual(cmd[:8], ["wsl.exe", "-d", "Ubuntu", "--cd", "/", "--exec", "python3", "-"])
+                replay = cmd[8:]
+                self.assertEqual(replay[:2], ["replay", "/dataset"])
+                replay[1] = str(work)
+                return popen([sys.executable, "-", *replay], **dict(kwargs, cwd=root))
+
+            with patch.object(live.subprocess, "Popen", launch):
+                # Reaching the first corpus file proves the manifest and source hash passed.
+                with self.assertRaisesRegex(RuntimeError, "censpruef_kanon.bin"):
+                    with live.source(args):
+                        self.fail("an empty producer cannot provide training rows")
+
     def test_boundaries_and_targets(self):
         expected, data = fixture([4096, 1, 4101, 35])
         actual = list(live.documents(io.BytesIO(data)))
