@@ -6,6 +6,8 @@ This fork uses Ehsan Jahanbakhsh’s shared high/low Recursive Refiner blocks as
 
 The original submission and its measurements are documented below. To reproduce its build in this fork, select `BYTE_MODEL=transformer`.
 
+For full-enwik9 training on a laptop, the live trainer sends PPMd probabilities straight from the original preprocessing and predictor code to PyTorch. Its prepared inputs and producer take about 486 MiB on disk. The separate raw-XML enwik8 run needs about 96 MiB of prepared files. Both checkpoint the compact refiner and stop when held-out Q4 prediction loss plateaus. [enwik9 GPU training](training/refiner/README.md#full-enwik9-training-with-bounded-disk-use) · [enwik8 GPU training](training/refiner/README.md#enwik8-training)
+
 ## Original cmix-neif-2.0 submission
 
 **Submitted by Marcus Wölk, Ellefeld, Germany.**

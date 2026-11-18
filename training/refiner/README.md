@@ -20,6 +20,50 @@ clang++-18 -std=c++17 -O3 -march=x86-64-v3 -ffp-model=precise -ffp-contract=off 
   src/refiner/refiner.cpp src/tf1/opt/glue.cpp src/detmath.cpp -o build-refiner/refiner-check
 ```
 
+## Full enwik9 training with bounded disk use
+
+Use this mode for training the 301,824-parameter refiner until its validation loss stops improving. The Linux producer replays the canonical enwik9 input each epoch and sends the actual fed tokens, article resets, next-byte targets and 208 float16 PPMd probabilities to PyTorch. The trainer consumes the pipe in bounded buffers. A full pass transfers roughly 228 GB through memory. The prepared input, dictionary and native producer occupy **486 MiB on disk**. Each run also needs room for the native PPMd page file (up to 14,000 MiB apparent), preprocessing scratch and small training checkpoints. Budget about **20 GiB free** on the Linux filesystem as a planning estimate. The peak of an entire training run has not been measured. [Upstream preprocessing modes](../tf/1_dump/README.md) · [Upstream scratch usage](../../README.md#11-prerequisites)
+
+**Prepare once** from the fork root with Ubuntu, Python 3.11+, git, tar, patch, make, clang++-18 and lld-18. The preparer checks enwik9, the generated canonical stream, the census input and the dictionary against their hashes. It builds the producer from pinned upstream code plus the row-output patch. If you have already built the upstream canonical stream, add `--reuse-bed /path/to/bed` to reuse its two verified inputs.
+
+```bash
+python3 training/refiner/live_data.py prepare /path/to/enwik9 ~/cmix-live-enwik9
+```
+
+**Train** from the fork root with CUDA-enabled PyTorch, Transformers 4.x, NumPy and filelock. The following PowerShell command uses the Windows GPU environment and starts the producer inside Ubuntu. Replace the Linux username or work path when running elsewhere.
+
+```powershell
+.\build-refiner\gpu-env\Scripts\python.exe -u training/refiner/train_live.py --dataset enwik9 --work /home/hp/cmix-live-enwik9 --wsl Ubuntu --device cuda --run-dir build-refiner/live-enwik9-training
+```
+
+On a Linux GPU host, use the Linux environment directly.
+
+```bash
+python -u training/refiner/train_live.py --dataset enwik9 --work "$HOME/cmix-live-enwik9" --device cuda --run-dir build-refiner/live-enwik9-training
+```
+
+One epoch visits the full stream once. About 5% of documents are assigned deterministically to validation. The trainer samples up to 1,024 fixed validation windows across those documents and reports their target-weighted loss in bits per byte after each full pass. Training uses batch 16, 128-token crops, a 64-token sliding window, 512 locally shuffled windows per buffer, and quantization-aware training from the first update. The best export is `best.rrb`. The default stopping rule is three consecutive passes without a cumulative improvement of 0.005 validation bits per byte over the last qualifying score. `--patience` and `--min-delta` set this rule. `--max-epochs` optionally caps a run and prints when that cap caused the stop.
+
+Repeating the same command resumes `state.pt`. The trainer checkpoints every 32 training buffers and after every epoch. On a mid-epoch restart it regenerates PPMd history from the beginning of that pass and skips completed optimizer updates. The native producer reports progress in `producer.log`; the metadata and PPMd warm-up come before the main training rows. The extra CPU work per epoch is the cost of avoiding the dense table. Upstream's published 712-epoch experiment uses a different window, shuffling, split, optimizer and quantization schedule. [Live training code](train_live.py) · [Row producer](live_data.py) · [Original training recipe](../README.md)
+
+### enwik8 training
+
+The smaller benchmark uses 100,000,000 bytes of original Wikipedia XML. The preparation command accepts either uncompressed enwik8 or the original enwik9 and verifies the extracted bytes. enwik8 contains 205 distinct byte values. This mode maps them in increasing byte order to the first 205 refiner slots, preserves every input byte, and streams PPMd probabilities in that order. It holds out complete document pieces, starts a new piece at each XML page, and splits very long pieces at 131,072 bytes. The prepared data and producer use about 96 MiB. This is a raw-XML training experiment with its own checkpoint vocabulary. The enwik9 executable expects the dictionary-transformed enwik9 vocabulary. [Published enwik8 size and checksums](https://mattmahoney.net/dc/textdata.html)
+
+Build the sample binary above from this fork and prepare enwik8 once in Linux.
+
+```bash
+python3 training/refiner/live_data.py prepare-enwik8 /path/to/enwik9 ~/cmix-live-enwik8 --binary build-refiner/cmix-refiner
+```
+
+Start or resume the separate enwik8 run from PowerShell.
+
+```powershell
+.\build-refiner\gpu-env\Scripts\python.exe -u training/refiner/train_live.py --dataset enwik8 --work /home/hp/cmix-live-enwik8 --wsl Ubuntu --device cuda --run-dir build-refiner/live-enwik8-training
+```
+
+On Linux, omit `--wsl Ubuntu` and invoke `python` from the GPU environment. Validation loss for this run is per scored raw XML byte. The enwik9 run reports per scored transformed byte.
+
 ## Compact enwik9 pilot
 
 The compact preset keeps the high and low states, sliding attention, PPMd output gate and both 192-feature connections to cmix. It uses one shared block of width 192, three attention heads, a 192-wide SwiGLU and two rounds of one low update followed by one high update. This gives four block evaluations per byte and **301,824 trainable parameters**. The 64-token-window Q4 checkpoint is **198,016 bytes**. The Hutter score counts the weights twice because both executables carry a copy. At this window the compact weights save **9,196,160 bytes** against the matched refiner before accounting for any change in the coded payload.

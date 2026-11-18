@@ -1,0 +1,86 @@
+--- a/src/predictor.cpp
++++ b/src/predictor.cpp
+@@ -2983,7 +2983,7 @@
+         if (ppmd_only_bytes_buf_.size() >= (1u << 16)) PpmdOnlyBytesFlush();
+       }
+       if (tf1_engine_) {
+-        tf1_engine_->Step(dumponly_prior_, manager_.bit_context_);
++        tf1_engine_->Step(byte_model_->BytePredict(), manager_.bit_context_);
+       }
+       manager_.bit_context_ = 1;
+     }
+--- a/src/tf1/tf1_engine.cpp
++++ b/src/tf1/tf1_engine.cpp
+@@ -394,7 +394,16 @@
+   bool pk_titel_now;
+   bool pk_autor_now;
+   bool pk_meta_now;
+-  void PkUnmaskLast() {
++  FILE* refiner_rows = nullptr;
++  unsigned char refiner_row[420] = {};
++  bool refiner_pending = false;
++  void EmitRefinerRow() {
++    if (refiner_pending && fwrite(refiner_row, sizeof(refiner_row), 1, refiner_rows) != 1)
++      Fail("writing live refiner rows failed");
++    refiner_pending = false;
++  }
++  void PkUnmaskLast(int token) {
++    if (refiner_pending && refiner_row[1] == 255) refiner_row[1] = (unsigned char)token;
+     if (pk_last_valid) pk_dbuf[pk_last_off + 9] &= (unsigned char)~2u;
+   }
+   void PkHeader() {
+@@ -482,7 +491,16 @@
+     bool pk_p0 = false;
+     if (prompt && prior == prompt->Prior0()) pk_p0 = true;
+     if (!pk_p0 && z3 && prior == z3->Prior0()) pk_p0 = true;
++    if (refiner_rows) {
++      EmitRefinerRow();
++      refiner_row[0] = (unsigned char)tok;
++      refiner_row[1] = 255;  // Filled when the following stream byte is scored.
++      refiner_row[2] = (unsigned char)pk_docstart;
++      memcpy(refiner_row + 4, prior, 416);
++      refiner_pending = true;
++    }
+     PkRecord(tok, inserted, pk_p0);
++    if (refiner_rows) pk_docstart = false;
+     (void)out;
+     (void)prior;
+ #else
+@@ -507,6 +525,7 @@
+     pk_prev1 = 216;
+     pk_prev2 = 216;
+ #if TRAIN_MODE == 2 || TRAIN_MODE == 3
++    EmitRefinerRow();
+     BL_ST(++pk_documents);
+     pk_docstart = true;
+ #endif
+@@ -609,6 +628,11 @@
+     impl_->gate = new tf_gate::CoderGate(gp);
+   }
+ #if TRAIN_MODE == 2 || TRAIN_MODE == 3
++  if (const char* path = Env("CMIX_REFINER_ROWS")) {
++    impl_->refiner_rows = fopen(path, "wb");
++    if (!impl_->refiner_rows || fwrite("RRL1", 1, 4, impl_->refiner_rows) != 4)
++      Fail("opening live refiner row stream failed");
++  }
+   if (const char* p = PaketDumpPath()) {
+     const std::string path = std::string(p) + "paket-zeilen.bin";
+     impl_->pk_dump = fopen(path.c_str(), "wb");
+@@ -649,6 +673,10 @@
+   if (impl_->prompt) impl_->prompt->Finish();
+   ReportChannels();
+ #if TRAIN_MODE == 2 || TRAIN_MODE == 3
++  if (impl_->refiner_rows) {
++    impl_->EmitRefinerRow();
++    if (fclose(impl_->refiner_rows)) Fail("closing live refiner rows failed");
++  }
+   if (impl_->pk_dump) {
+     if (!impl_->pk_dbuf.empty()) {
+       fwrite(impl_->pk_dbuf.data(), 1, impl_->pk_dbuf.size(), impl_->pk_dump);
+@@ -769,5 +797,5 @@
+       pk_masked = true;
+     }
+-    if (!pk_masked) s.PkUnmaskLast();
++    if (!pk_masked) s.PkUnmaskLast(s.byte_to_index[byte]);
+ #endif
+   }

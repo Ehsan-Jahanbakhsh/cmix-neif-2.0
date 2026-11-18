@@ -915,6 +915,64 @@ bool RunDecompression(const std::string& input_path,
 
 namespace ppmd_page { extern int hilfs; }
 #ifdef CMIX_SAMPLE
+// Original enwik8 XML has 205 distinct bytes. Map them reversibly to the
+// refiner's first 205 output slots in increasing raw-byte order.
+static int Enwik8TrainingRows(const char* path, const char* output) {
+  FILE* in = fopen(path, "rb");
+  if (!in) { perror(path); return 1; }
+  std::vector<unsigned char> text(100000000);
+  bool ok = fread(text.data(), 1, text.size(), in) == text.size() &&
+            getc(in) == EOF && !ferror(in);
+  fclose(in);
+  if (!ok) { fprintf(stderr, "expected 100,000,000 bytes of enwik8 XML\n"); return 1; }
+  std::vector<bool> vocab(256, false);
+  for (unsigned b : text) vocab[b] = true;
+  unsigned char ids[256] = {};
+  std::vector<unsigned> alphabet;
+  for (unsigned b = 0; b < 256; ++b) if (vocab[b]) {
+    ids[b] = static_cast<unsigned char>(alphabet.size());
+    alphabet.push_back(b);
+  }
+  if (alphabet.size() != 205) { fprintf(stderr, "unexpected enwik8 alphabet\n"); return 1; }
+  FILE* sink = fopen(output, "wb");
+  if (!sink) { perror(output); return 1; }
+  ok = fwrite("RRL1", 1, 4, sink) == 4;
+  ppmd_page::hilfs = 1;
+  // Make ByteModel filter probabilities with the supplied raw XML vocabulary.
+  vocab_frozen::g_aux = true;
+  unsigned byte = 0;
+  PPMD::PPMD ppmd(25, 14000, byte, vocab);
+  struct Row {
+    unsigned char token, target, start, reserved;
+    uint16_t prior[208];
+  };
+  static_assert(sizeof(Row) == 420, "live training row layout");
+  static const char marker[] = "  <page>\n";
+  bool start = true;
+  size_t in_doc = 0;
+  float probs[208] = {};
+  for (size_t i = 0; ok && i < text.size(); ++i) {
+    byte = text[i];
+    ppmd.ByteUpdate();
+    const auto& raw = ppmd.BytePredict();
+    for (size_t j = 0; j < alphabet.size(); ++j) probs[j] = raw[alphabet[j]];
+    const size_t next = i + 1;
+    const bool next_start = ++in_doc == 131072 ||
+        (byte == '\n' && text.size()-next >= sizeof(marker)-1 &&
+         memcmp(text.data()+next, marker, sizeof(marker)-1) == 0);
+    Row row{};
+    row.token = ids[byte];
+    row.target = (next == text.size() || next_start) ? 255 : ids[text[next]];
+    row.start = start;
+    transformer::FloatsToHalves(probs, row.prior, 208);
+    ok = fwrite(&row, sizeof(row), 1, sink) == 1;
+    start = next_start;
+    if (start) in_doc = 0;
+  }
+  if (fclose(sink)) ok = false;
+  return ok ? 0 : 1;
+}
+
 // One float16 PPMd row after each input byte, in the neural head's order.
 static int SamplePriors(const char* path, const char* output) {
   FILE* input = fopen(path, "rb");
@@ -1040,6 +1098,7 @@ static int SampleRoundTrip(bool verify, const char* reference, const char* paylo
 #endif
 int main(int argc, char** argv) {
 #ifdef CMIX_SAMPLE
+  if (argc == 4 && !strcmp(argv[1], "--enwik8-rows")) return Enwik8TrainingRows(argv[2], argv[3]);
   if (argc == 4 && !strcmp(argv[1], "--sample-priors")) return SamplePriors(argv[2], argv[3]);
   if (argc == 3 && !strcmp(argv[1], "--sample-score")) return SampleScore(argv[2]);
   if (argc == 4 && (!strcmp(argv[1], "--sample-write") || !strcmp(argv[1], "--sample-verify")))
