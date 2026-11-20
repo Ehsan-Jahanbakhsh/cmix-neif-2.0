@@ -1,6 +1,7 @@
 """Prepare enwik8 or enwik9 and stream its training rows from Linux."""
 import argparse
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import partial
 import hashlib
@@ -155,32 +156,56 @@ def native_rows(work, dataset, *, stop_early=False):
                 os.close(write_end)
 
 
+def transfer_chunks(chunks, output, cache_chunk=None):
+    # Keep reading the next Linux pipe chunk while the previous one crosses WSL
+    # and (on the first pass) is compressed. Each destination sees strict order.
+    with ThreadPoolExecutor(max_workers=2 if cache_chunk else 1) as pool:
+        pending = []
+        for raw in chunks:
+            for task in pending:
+                task.result()
+            pending = [pool.submit(output.write, raw)]
+            if cache_chunk is not None:
+                pending.append(pool.submit(cache_chunk, raw))
+        for task in pending:
+            task.result()
+
+
 def build_cache(cache, identity, total, budget, open_rows, output):
     # Keep the newest consecutive chunks. A suffix can be replayed without
     # reconstructing PPMd state after the cached section.
     chunks = deque()
     used = rows = 0
+
+    def read_chunks(stream):
+        position = 0
+        while raw := stream.read(CHUNK_ROWS * ROW_BYTES):
+            if len(raw) != min(CHUNK_ROWS, total - position) * ROW_BYTES:
+                raise ValueError("unexpected native row count")
+            position += len(raw) // ROW_BYTES
+            yield raw
+        if position != total:
+            raise ValueError(f"truncated native stream: {position} of {total} rows")
+
+    def store(raw):
+        nonlocal used, rows
+        packed = zlib.compress(raw, 1)
+        while chunks and used + len(packed) > budget:
+            old_start, size, _ = chunks.popleft()
+            (cache/f"{old_start}.zlib").unlink()
+            used -= size
+        if len(packed) > budget:
+            raise ValueError("cache budget is smaller than one chunk")
+        (cache/f"{rows}.zlib").write_bytes(packed)
+        chunks.append((rows, len(packed), hashlib.sha256(packed).hexdigest()))
+        used += len(packed)
+        rows += len(raw) // ROW_BYTES
+
     with open_rows() as stream:
         if stream.read(4) != b"RRL1":
             raise ValueError("invalid row header")
         output.write(b"RRL1")
-        while raw := stream.read(CHUNK_ROWS * ROW_BYTES):
-            if len(raw) != min(CHUNK_ROWS, total - rows) * ROW_BYTES:
-                raise ValueError("unexpected native row count")
-            output.write(raw)
-            packed = zlib.compress(raw, 1)
-            while chunks and used + len(packed) > budget:
-                old_start, size, _ = chunks.popleft()
-                (cache/f"{old_start}.zlib").unlink()
-                used -= size
-            if len(packed) > budget:
-                raise ValueError("cache budget is smaller than one chunk")
-            (cache/f"{rows}.zlib").write_bytes(packed)
-            chunks.append((rows, len(packed), hashlib.sha256(packed).hexdigest()))
-            used += len(packed)
-            rows += len(raw) // ROW_BYTES
-    if rows != total:
-        raise ValueError(f"truncated native stream: {rows} of {total} rows")
+        transfer_chunks(read_chunks(stream), output, store)
     index = dict(version=1, identity=identity, total=total, chunks=list(chunks))
     (cache/"index.tmp").write_text(json.dumps(index))
     (cache/"index.tmp").replace(cache/"index.json")
@@ -198,29 +223,35 @@ def replay_cache(cache, identity, total, budget, open_rows, output):
         raise ValueError("incomplete PPMd cache index")
     if sum(c[1] for c in chunks) > budget:
         raise ValueError("existing PPMd cache exceeds requested budget; use its original budget")
+    def prefix(stream):
+        remaining = start * ROW_BYTES
+        while remaining:
+            raw = stream.read(min(1 << 20, remaining))
+            if not raw:
+                raise EOFError("native stream ended before cached suffix")
+            yield raw
+            remaining -= len(raw)
+
     if start:
         with open_rows(stop_early=True) as stream:
             if stream.read(4) != b"RRL1":
                 raise ValueError("invalid row header")
             output.write(b"RRL1")
-            remaining = start * ROW_BYTES
-            while remaining:
-                raw = stream.read(min(1 << 20, remaining))
-                if not raw:
-                    raise EOFError("native stream ended before cached suffix")
-                output.write(raw)
-                remaining -= len(raw)
+            transfer_chunks(prefix(stream), output)
     else:
         output.write(b"RRL1")
     print(f"Reading {total-start:,} cached rows starting at {start:,}.", file=sys.stderr)
-    for offset, size, digest in chunks:
-        packed = (cache/f"{offset}.zlib").read_bytes()
-        if len(packed) != size or hashlib.sha256(packed).hexdigest() != digest:
-            raise ValueError(f"damaged PPMd cache chunk at row {offset}")
-        raw = zlib.decompress(packed)
-        if len(raw) != min(CHUNK_ROWS, total-offset) * ROW_BYTES:
-            raise ValueError(f"wrong row count in cached chunk at {offset}")
-        output.write(raw)
+    def suffix():
+        for offset, size, digest in chunks:
+            packed = (cache/f"{offset}.zlib").read_bytes()
+            if len(packed) != size or hashlib.sha256(packed).hexdigest() != digest:
+                raise ValueError(f"damaged PPMd cache chunk at row {offset}")
+            raw = zlib.decompress(packed)
+            if len(raw) != min(CHUNK_ROWS, total-offset) * ROW_BYTES:
+                raise ValueError(f"wrong row count in cached chunk at {offset}")
+            yield raw
+
+    transfer_chunks(suffix(), output)
 
 
 def replay(work, dataset, patch_sha256=None, cache_gib=0):

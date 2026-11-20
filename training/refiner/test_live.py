@@ -66,6 +66,20 @@ class LiveTrainingTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "damaged"):
                     live_data.replay_cache(cache, "producer", 11, budget, open_rows, io.BytesIO())
 
+    def test_transfer_failure_does_not_publish_cache(self):
+        class ClosedPipe(io.BytesIO):
+            def write(self, data):
+                if data != b"RRL1":
+                    raise BrokenPipeError
+                return super().write(data)
+
+        data = b"RRL1" + bytes(4 * live_data.ROW_BYTES)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(live_data, "CHUNK_ROWS", 2):
+            cache = Path(tmp)
+            with self.assertRaises(BrokenPipeError):
+                live_data.build_cache(cache, "producer", 4, 1024, lambda: io.BytesIO(data), ClosedPipe())
+            self.assertFalse((cache/"index.json").exists())
+
     def test_wsl_replay_without_repository_mount(self):
         # Stand in for wsl.exe by running the delivered script in an empty cwd.
         popen = subprocess.Popen
