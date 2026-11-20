@@ -74,10 +74,11 @@ Model::Model(const char* path) {
   char magic[4];
   uint32_t h[7];
   if (std::fread(magic, 1, 4, file) != 4 ||
-      (std::memcmp(magic, "RRB1", 4) && std::memcmp(magic, "RRB2", 4)) ||
+      (std::memcmp(magic, "RRB1", 4) && std::memcmp(magic, "RRB2", 4) && std::memcmp(magic, "RRB3", 4)) ||
       std::fread(h, sizeof(h[0]), 7, file) != 7)
-    fail("expected an RRB1 or RRB2 checkpoint");
-  rolling_ = magic[3] == '2';
+    fail("expected an RRB1, RRB2 or RRB3 checkpoint");
+  rolling_ = magic[3] != '1';
+  score_feedback_ = magic[3] == '3';
   // width, heads, FFN width, shared layers, H cycles, L cycles, context
   if (h[0] < 192 || h[0] > 1024 || !h[1] || h[0] % h[1] || (h[0]/h[1]) % 2 ||
       !h[2] || h[2] > 8192 || !h[3] || h[3] > 32 || !h[4] || h[4] > 8 ||
@@ -140,6 +141,14 @@ Model::Model(const char* path) {
     r->resize(d);
   gates_.resize(2*f); ff_.resize(f); scores_.resize(context_);
   embedding_.resize(d); previous_q_.resize(d);
+  if (score_feedback_) {
+    score_input_.resize(d);
+    base_scores_.resize(208); byte_scores_.resize(208); byte_probs_.resize(208);
+    byte_embeddings_.resize(208*d);
+    for (int v = 0; v < 208; ++v)
+      for (size_t i = 0; i < d; ++i)
+        byte_embeddings_[v*d+i] = embeddings_.codes[v*d+i] * embeddings_.scales[v];
+  }
 }
 
 void Model::Linear::apply(const Row& input, Row& output) const {
@@ -204,6 +213,24 @@ void Model::update(Row& state, const Row& injection, int& pass) {
   }
 }
 
+void Model::revise(Row& state, const Row& injection, int& pass, bool project_scores) {
+  std::copy(byte_scores_.begin(), byte_scores_.end(), byte_probs_.begin());
+  softmax(byte_probs_.data(), 208);
+  std::fill(score_input_.begin(), score_input_.end(), 0.f);
+  for (int v = 0; v < 208; ++v) {
+    const float* row = byte_embeddings_.data() + v*width_;
+    for (int i = 0; i < width_; ++i) score_input_[i] += byte_probs_[v] * row[i];
+  }
+  for (int i = 0; i < width_; ++i) score_input_[i] += injection[i];
+  update(state, score_input_, pass);
+  if (!project_scores) return;
+  const float scale = 15.f / (high_cycles_*(1 + low_cycles_));
+  for (int v = 0; v < 208; ++v) {
+    float correction = dot(state.data(), byte_embeddings_.data() + v*width_, width_);
+    byte_scores_[v] += scale * std::tanh(correction/15.f);
+  }
+}
+
 void Model::step(unsigned token, float* probabilities, bool read, const float* prior) {
   if (token >= 216) fail("input token outside the cmix alphabet");
   // Buffers retain their addresses because the cmix bit head keeps a pointer.
@@ -214,12 +241,31 @@ void Model::step(unsigned token, float* probabilities, bool read, const float* p
     embedding_[i] = rolling_ ? embeddings_.codes[j]*embeddings_.scales[token] : embeddings_.fp32[j];
   }
   int pass = 0;
+  if (score_feedback_) {
+    if (!prior) fail("score feedback requires a prior on every row");
+    float sum = 0.f;
+    for (int v = 0; v < 208; ++v)
+      sum += (base_scores_[v] = std::log(std::max(prior[v], std::exp(-12.f))));
+    for (int v = 0; v < 208; ++v) byte_scores_[v] = (base_scores_[v] -= sum/208.f);
+  }
   for (int h = 0; h < high_cycles_; ++h) {
     for (int i = 0; i < width_; ++i) injection_[i] = high_[i] + embedding_[i];
-    for (int l = 0; l < low_cycles_; ++l) update(low_, injection_, pass);
-    update(high_, low_, pass);
+    if (score_feedback_) {
+      for (int l = 0; l < low_cycles_; ++l) revise(low_, injection_, pass);
+      revise(high_, low_, pass, read || h+1 < high_cycles_);
+    } else {
+      for (int l = 0; l < low_cycles_; ++l) update(low_, injection_, pass);
+      update(high_, low_, pass);
+    }
   }
-  if (read) {
+  if (read && score_feedback_) {
+    float rms = std::sqrt(dot(high_.data(), high_.data(), width_) / width_ + 1e-5f);
+    float x = dot(high_.data(), prior_gate_.data(), width_)/rms + 0.5413248546129181f;
+    float gate = std::max(0.f, x) + std::log1p(std::exp(-std::abs(x)));
+    for (int v = 0; v < 208; ++v)
+      probabilities[v] = byte_scores_[v] + (gate - 1.f)*base_scores_[v];
+    softmax(probabilities, 208);
+  } else if (read) {
     for (int v = 0; v < 208; ++v)
       probabilities[v] = embeddings_.product(high_, v);
     if (rolling_) {

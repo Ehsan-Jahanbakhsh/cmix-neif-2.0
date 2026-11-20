@@ -327,7 +327,8 @@ struct Tf1Engine::Impl {
            ) {
 #ifdef CMIX_REFINER
     float prior_f32[208];
-    if (gelesen && opt->uses_prior()) RowToFloats(prior, prior_f32);
+    if ((gelesen && opt->uses_prior()) || opt->needs_prior_on_unread_rows())
+      RowToFloats(prior, prior_f32);
     opt->step(tok, out, gelesen, prior_f32);
 #else
     if (opt) opt->set_gelesen(gelesen);

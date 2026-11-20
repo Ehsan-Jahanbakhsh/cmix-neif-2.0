@@ -49,12 +49,13 @@ def enable_q4(model):
             parametrize.register_parametrization(layer, "weight", FakeQ4())
 
 
-def make_model(dims, window, max_positions):
+def make_model(dims, window, max_positions, score_feedback=False):
     d, heads, ff, blocks, h, l = dims
     config = RecursiveRefinerConfig(vocab_size=INPUT_ROWS, hidden_size=d, num_attention_heads=heads,
         num_hidden_layers=blocks, expansion=ff/d, hi_cycles=h, lo_cycles=l, embed_factor=1,
         is_causal=True, max_position_embeddings=max(max_positions, 2*window+5))
     model = RecursiveRefinerModel(config)
+    model.score_feedback = score_feedback
     for block in model.shared.blocks:
         block.attn.window_size = window
     model.prior_gate = torch.nn.Parameter(torch.zeros(d))
@@ -75,7 +76,7 @@ def tensors_for_export(model, window):
 def export(model, dims, window, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(dir=path.parent, delete=False) as tmp:
-        tmp.write(struct.pack("<4s7I", b"RRB2", *dims, window))
+        tmp.write(struct.pack("<4s7I", b"RRB3" if model.score_feedback else b"RRB2", *dims, window))
         for item in tensors_for_export(model, window):
             if isinstance(item, torch.nn.Module):
                 codes, scale = q4(item.parametrizations.weight.original)
@@ -170,16 +171,47 @@ class Blocks:
         return tuple(torch.from_numpy(a).to(device) for a in (x, y, p))
 
 
+def prior_strength(model, hidden):
+    scaled = hidden * (hidden.square().mean(-1, keepdim=True) + 1e-5).rsqrt()
+    return F.softplus((scaled @ model.prior_gate).unsqueeze(-1) + 0.5413248546129181)
+
+
+def prior_scores(prior):
+    logp = prior.float().clamp_min(math.exp(-12)).log()
+    return logp - logp.mean(-1, keepdim=True)
+
+
 def byte_head(model, hidden, prior):
     raw = F.linear(hidden, model.embed.tok.weight[:VOCAB])
-    scaled = hidden * (hidden.square().mean(-1, keepdim=True) + 1e-5).rsqrt()
-    gate = F.softplus((scaled @ model.prior_gate).unsqueeze(-1) + 0.5413248546129181)
-    logp = prior.float().clamp_min(math.exp(-12)).log()
-    return 15*(raw/15).tanh() + gate*(logp-logp.mean(-1, keepdim=True))
+    return 15*(raw/15).tanh() + prior_strength(model, hidden)*prior_scores(prior)
+
+
+def refine_scores(model, x, prior):
+    embedding = model.embed(x)
+    high, low = model.init_latents(*x.shape, embedding.device, embedding.dtype)
+    weights = model.embed.tok.weight[:VOCAB]
+    base = prior_scores(prior)
+    scores = base
+    updates = model.config.hi_cycles * (model.config.lo_cycles + 1)
+
+    def revise(state, injection, current):
+        # Read the current byte distribution as an expected byte embedding.
+        feedback = current.softmax(-1) @ weights
+        state = model.shared(state, inject=injection + feedback)
+        correction = F.linear(state, weights)
+        return state, current + (15.0/updates)*(correction/15.0).tanh()
+
+    for _ in range(model.config.hi_cycles):
+        for _ in range(model.config.lo_cycles):
+            low, scores = revise(low, high + embedding, scores)
+        high, scores = revise(high, low, scores)
+    return scores + (prior_strength(model, high)-1)*base, high, low
 
 
 def logits(model, x, prior):
     with parametrize.cached():
+        if model.score_feedback:
+            return refine_scores(model, x, prior)[0]
         hidden = model(x, return_dict=True).last_hidden_state
         return byte_head(model, hidden, prior)
 
@@ -211,30 +243,39 @@ def parity_fixture(model, window, path):
         for part, size in enumerate(sizes):
             ids = rng.integers(INPUT_ROWS, size=size, dtype=np.uint8)
             ids[0] = 215
-            low = []
-            def capture(_module, _inputs, result):
-                low.append(result)
-            handle = model.shared.register_forward_hook(capture)
-            try:
-                hidden = model(torch.tensor(ids).long()[None, :]).last_hidden_state[0]
-            finally:
-                handle.remove()
             prior = rng.random((size,VOCAB), dtype=np.float32)**4
             prior[:, 0] = 0
             prior = (prior/prior.sum(-1, keepdims=True)).astype("<f2").astype("<f4")
-            probs = byte_head(model, hidden, torch.from_numpy(prior)).softmax(-1)
+            tokens = torch.tensor(ids).long()[None, :]
+            p = torch.from_numpy(prior)[None, :]
+            if model.score_feedback:
+                with parametrize.cached():
+                    scores, high, low = refine_scores(model, tokens, p)
+            else:
+                updates = []
+                def capture(_module, _inputs, result):
+                    updates.append(result)
+                handle = model.shared.register_forward_hook(capture)
+                try:
+                    high = model(tokens).last_hidden_state
+                finally:
+                    handle.remove()
+                low = updates[-2]
+                scores = byte_head(model, high, p)
+            probs = scores[0].softmax(-1)
             for i, token in enumerate(ids):
                 reset = part == 1 and i == 0
                 read = i % 5 != 2
                 out.write(bytes((int(token), int(reset), int(read))))
                 out.write(prior[i].tobytes())
-                for row in (probs[i], hidden[i, :192], low[-2][0, i, :192]):
+                for row in (probs[i], high[0, i, :192], low[0, i, :192]):
                     out.write(row.numpy().astype("<f4", copy=False).tobytes())
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--preset", choices=PRESETS, default="matched")
+    p.add_argument("--score-feedback", action="store_true", help="revise the PPMd byte scores at every recursive update")
     p.add_argument("--blocks", type=int, help="number of distinct blocks in the shared stack")
     p.add_argument("--hi-cycles", type=int, help="high-state updates per token")
     p.add_argument("--lo-cycles", type=int, help="low-state updates per high-state update")
@@ -280,7 +321,7 @@ def main():
     if 2 * blocks * h * (l + 1) * d * window > 2**27:
         p.error("this configuration exceeds the native 512 MiB KV cache limit")
     dims = (d, heads, ff, blocks, h, l)
-    model = make_model(dims, window, args.context).to(args.device)
+    model = make_model(dims, window, args.context, args.score_feedback).to(args.device)
     count = sum(t.numel() for t in model.parameters())
     print(f"{args.preset}: {count:,} trainable parameters; baseline 9,285,596", flush=True)
     if not args.package and not any((args.demo_dir/f).is_file() for f in ("train.f16", "pilot.json")):

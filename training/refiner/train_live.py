@@ -169,7 +169,7 @@ def fit(args):
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     dims = PRESETS[args.preset]
-    model = make_model(dims, args.window, args.context).to(args.device)
+    model = make_model(dims, args.window, args.context, args.score_feedback).to(args.device)
     enable_q4(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     version = hashlib.sha256(Path(__file__).with_name("live_rows.patch").read_bytes()).hexdigest()
@@ -179,6 +179,8 @@ def fit(args):
             identity = hashlib.file_digest(f, "sha256").hexdigest()
     settings = (identity, dims, args.context, args.window, args.batch, args.buffer_windows, args.seed,
                 args.eval_windows, args.lr, args.min_delta, args.patience)
+    if args.score_feedback:
+        settings += ("score-feedback-v1",)
     path = args.run_dir/"state.pt"
     state = dict(settings=settings, epoch=0, buffers=0, best=math.inf, anchor=math.inf, stale=0, history=[])
     if path.exists():
@@ -300,6 +302,7 @@ def main():
     p.add_argument("--run-dir", type=Path, required=True)
     p.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     p.add_argument("--preset", choices=("compact", "compact-2x"), default="compact")
+    p.add_argument("--score-feedback", action="store_true", help="revise the PPMd byte scores at every recursive update")
     p.add_argument("--prefetch", action=argparse.BooleanOptionalAction, default=True,
                    help="prepare the next CPU buffer during the current optimizer updates")
     p.add_argument("--cache-gib", type=int, default=0, help="maximum Linux disk space for reusable PPMd rows")

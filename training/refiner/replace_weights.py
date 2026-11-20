@@ -1,4 +1,4 @@
-"""Install a trained RRB2 checkpoint in a copy of a packaged RRB2 compressor."""
+"""Install trained Q4 refiner weights in a compatible packaged compressor."""
 import argparse
 import os
 from pathlib import Path
@@ -9,7 +9,7 @@ from tempfile import NamedTemporaryFile
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("template", type=Path, help="comp9 built with the Q4 refiner")
-    parser.add_argument("weights", type=Path, help="RRB2 checkpoint exported by train.py")
+    parser.add_argument("weights", type=Path, help="RRB2 or RRB3 checkpoint exported by the refiner trainer")
     parser.add_argument("output", type=Path, help="path for a new executable")
     args = parser.parse_args()
     if args.output.exists():
@@ -21,10 +21,12 @@ def main():
     hints, order, previous = struct.unpack_from("<3i", image, len(image)-12)
     start = len(image)-12-previous
     if (min(hints, order, previous) <= 0 or start-hints-order <= 0 or
-            image[start:start+4] != b"RRB2"):
+            image[start:start+4] not in (b"RRB2", b"RRB3")):
         parser.error("template must contain a Q4 refiner checkpoint")
-    if len(weights) < 32 or weights[:4] != b"RRB2" or len(weights) >= 2**31:
-        parser.error("expected an RRB2 checkpoint from train.py")
+    if len(weights) < 32 or weights[:4] not in (b"RRB2", b"RRB3") or len(weights) >= 2**31:
+        parser.error("expected an RRB2 or RRB3 checkpoint from the refiner trainer")
+    if weights[:4] == b"RRB3" and image[start:start+4] != b"RRB3":
+        parser.error("for score feedback, build a template with REFINER_WEIGHTS pointing to an RRB3 checkpoint")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     pending = NamedTemporaryFile(dir=args.output.parent, delete=False)
     try:

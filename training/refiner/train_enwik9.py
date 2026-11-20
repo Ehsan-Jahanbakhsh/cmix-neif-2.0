@@ -15,7 +15,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from filelock import FileLock
 
-from train import PRESETS, ROOT, byte_head, enable_q4, export, make_model, package_docs
+from train import PRESETS, ROOT, byte_head, enable_q4, export, logits, make_model, package_docs
 
 TF = ROOT / "training/tf"
 sys.path[:0] = [str(TF / "tree_overlay"), str(TF / "tree_upstream")]
@@ -79,8 +79,11 @@ def document_loss(model, batch, use_bf16, checkpoint_from_rows):
     x, y, prior = batch
     model.shared.checkpoint_blocks = x.numel() >= checkpoint_from_rows
     with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=use_bf16):
-        high = model(x).last_hidden_state
-        scores = byte_head(model, high, prior)
+        if model.score_feedback:
+            scores = logits(model, x, prior)
+        else:
+            high = model(x).last_hidden_state
+            scores = byte_head(model, high, prior)
     return F.cross_entropy(scores.float().flatten(0, 1), y.flatten(), reduction="sum"), (y != -100).sum()
 
 
@@ -154,12 +157,14 @@ def run(args, device, rank, world):
     plan = BatchPlan(lengths, args.micro_rows, args.update_rows, world)
     signature = (dims, window, tuple(epochs), args.micro_rows, args.update_rows, args.forward_rows,
                  hashlib.sha256(lengths.tobytes()).hexdigest(), len(priors), configs, b3_cont)
+    if args.score_feedback:
+        signature += ("score-feedback-v1",)
     state_path = args.run_dir / "state.pt"
     previous = torch.load(state_path, map_location="cpu", weights_only=True) if state_path.exists() else None
     if previous and previous["plan"] != signature:
         raise ValueError("run settings or package differ from the saved run")
     torch.manual_seed(configs[0]["seed"])
-    model = make_model(dims, window, int(lengths.max())).to(device)
+    model = make_model(dims, window, int(lengths.max()), args.score_feedback).to(device)
     checkpoint_from_rows = args.checkpoint_from_rows
     if checkpoint_from_rows is None:
         checkpoint_from_rows = 8193 if args.preset == "compact" else 1
@@ -265,7 +270,8 @@ def main():
     p.add_argument("--package", type=Path, required=True, help="completed upstream pkg_check directory")
     p.add_argument("--run-dir", type=Path, required=True, help="checkpoint, resume state and export directory")
     p.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-    p.add_argument("--preset", choices=("compact", "matched"), help="model size (default: matched for a full run)")
+    p.add_argument("--preset", choices=("compact", "compact-2x", "matched"), help="model size (default: matched for a full run)")
+    p.add_argument("--score-feedback", action="store_true", help="revise the PPMd byte scores at every recursive update")
     p.add_argument("--until-stage", choices=STAGES, default="fp32")
     p.add_argument("--micro-rows", type=int, default=131072)
     p.add_argument("--update-rows", type=int, default=1048576)

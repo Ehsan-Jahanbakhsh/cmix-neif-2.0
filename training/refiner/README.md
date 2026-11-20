@@ -60,6 +60,31 @@ CPU preparation overlaps optimizer updates using two alternating buffers (one ex
 
 Repeating the same command resumes `state.pt`. The trainer checkpoints every 32 training buffers and after every epoch. On a mid-epoch restart it regenerates PPMd history from the beginning of that pass and skips completed optimizer updates. The native producer reports progress in `producer.log`; the metadata and PPMd warm-up come before the main training rows. The extra CPU work per epoch is the cost of avoiding the dense table. Upstream's published 712-epoch experiment uses a different window, shuffling, split, optimizer and quantization schedule. [Live training code](train_live.py) · [Row producer](live_data.py) · [Original training recipe](../README.md)
 
+### Revising the next-byte scores inside the refiner
+
+Add `--score-feedback` to the training command and choose a fresh `--run-dir` for this architecture. Each position starts with the centered PPMd log probabilities for its next byte. At every low or high update, the current probabilities weight the 208 byte embeddings to produce a feedback vector. The shared block reads that vector, and the tied byte head adds a correction to the current scores. The final high state also controls the weight given to the original PPMd estimate. The compact-2x preset still has four updates and 603,360 parameters.
+
+To compare from identical initial weights on cached enwik9 rows, run this from the fork root in PowerShell. The default budget is 900 seconds of synchronized training per model. The comparison alternates batch order, holds out whole cache chunks, and scores the same validation windows at equal updates and equal training time. Data loading and evaluation add to wall time.
+
+```powershell
+.\build-refiner\gpu-env\Scripts\python.exe -u training/refiner/compare_score_feedback.py --cache '\\wsl.localhost\Ubuntu\home\hp\cmix-live-enwik9\refiner-row-cache-v1' --out build-refiner/score-feedback-comparison
+```
+
+The output directory contains `results.json`, the held-out panel, both model snapshots and both Q4 exports. The score-feedback model uses the RRB3 format. To embed it, build from this source with `REFINER_WEIGHTS` pointing to the RRB3 export. The native predictor reads a prior on every fed row because even a row whose output is skipped can affect later predictions.
+
+In a paired enwik9 experiment on an RTX 4070 Laptop, both compact-2x models started from seed 1 and used batch 128, a 64-token attention window and Q4-aware AdamW updates. Their validation panel contained 61,649 scored targets drawn from 32 held-out chunks. Another training job shared the GPU during the first part of the comparison. Loading cached windows and evaluating both models brought the elapsed time for the 30 minutes of optimizer updates to about 41 minutes.
+
+| Measurement | Current refiner | Score feedback |
+|---|---:|---:|
+| Held-out bits per scored byte after the same 8,242 updates | 2.51010 | 2.50300 |
+| Updates in 15 minutes of timed training each | 9,235 | 8,242 |
+| Held-out bits per scored byte after 15 minutes each | 2.49855 | 2.50300 |
+| Bits per scored byte on 61,911 previously seen training targets after 15 minutes each | 2.48923 | 2.49747 |
+| Single-threaded C++ predictor time for 128,812 held-out input rows | 30.84 s | 38.51 s |
+| Q4 weight file | 354,944 bytes | 354,944 bytes |
+
+At equal time each model won 16 of the 32 held-out chunks. A paired bootstrap over chunks gave a 95% interval of −0.0047 to +0.0153 bits per scored byte for score feedback minus current. The CPU measurement used cached PPMd distributions and requested the next-byte probabilities on every input row. Archive size requires a separate compression run.
+
 ### enwik8 training
 
 The smaller benchmark uses 100,000,000 bytes of original Wikipedia XML. The preparation command accepts either uncompressed enwik8 or the original enwik9 and verifies the extracted bytes. enwik8 contains 205 distinct byte values. This mode maps them in increasing byte order to the first 205 refiner slots, preserves every input byte, and streams PPMd probabilities in that order. It holds out complete document pieces, starts a new piece at each XML page, and splits very long pieces at 131,072 bytes. The prepared data and producer use about 96 MiB. This is a raw-XML training experiment with its own checkpoint vocabulary. The enwik9 executable expects the dictionary-transformed enwik9 vocabulary. [Published enwik8 size and checksums](https://mattmahoney.net/dc/textdata.html)

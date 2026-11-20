@@ -34,6 +34,24 @@ def fixture(lengths):
 
 
 class LiveTrainingTest(unittest.TestCase):
+    def test_score_feedback_uses_past_priors_causally(self):
+        torch.manual_seed(3)
+        torch.set_num_threads(1)
+        x = torch.tensor([[11, 27, 9, 117, 207, 3]])
+        prior = torch.ones(1, x.shape[1], 208)/208
+        changed = prior.clone()
+        changed[:, 3, :] = 0.
+        changed[:, 3, 70] = 1.
+        for feedback in (False, True):
+            model = live.make_model(live.PRESETS["compact"], 4, 8, feedback)
+            live.enable_q4(model)
+            with torch.no_grad():
+                before = live.logits(model, x, prior)
+                after = live.logits(model, x, changed)
+            torch.testing.assert_close(before[:, :3], after[:, :3], atol=0., rtol=0.)
+            self.assertFalse(torch.equal(before[:, 3], after[:, 3]))
+            self.assertEqual(torch.equal(before[:, 4:], after[:, 4:]), not feedback)
+
     def test_cached_replay_matches_live_bytes(self):
         data = b"RRL1" + np.random.default_rng(4).bytes(11 * live_data.ROW_BYTES)
         opened = []
@@ -128,7 +146,7 @@ class LiveTrainingTest(unittest.TestCase):
             args = argparse.Namespace(rows_file=rows, dataset="enwik9", run_dir=root/"control", device="cpu", threads=1,
                     seed=1, batch=4, context=8, window=4, buffer_windows=16, eval_windows=8,
                     lr=2e-4, save_every=4, min_delta=100., patience=1, max_epochs=None, epochs=None,
-                    preset="compact", prefetch=False, cache_gib=0)
+                    preset="compact", prefetch=False, cache_gib=0, score_feedback=False)
             args.run_dir.mkdir()
             live.fit(args)
             args.run_dir = root/"resume"
@@ -153,6 +171,9 @@ class LiveTrainingTest(unittest.TestCase):
             self.assertEqual(extended["epoch"], 3)
             self.assertEqual(extended["history"][:-1], resumed["history"])
             self.assertEqual(extended["panel_sha"], resumed["panel_sha"])
+            args.score_feedback = True
+            with self.assertRaisesRegex(ValueError, "settings differ"):
+                live.fit(args)
 
 
 if __name__ == "__main__":
