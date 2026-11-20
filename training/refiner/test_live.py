@@ -1,5 +1,6 @@
 """Regression checks for the live row reader and training restart."""
 import argparse
+from contextlib import contextmanager
 import hashlib
 import io
 import json
@@ -14,6 +15,7 @@ import numpy as np
 import torch
 
 import train_live as live
+import live_data
 
 
 def fixture(lengths):
@@ -32,6 +34,38 @@ def fixture(lengths):
 
 
 class LiveTrainingTest(unittest.TestCase):
+    def test_cached_replay_matches_live_bytes(self):
+        data = b"RRL1" + np.random.default_rng(4).bytes(11 * live_data.ROW_BYTES)
+        opened = []
+
+        @contextmanager
+        def open_rows(stop_early=False):
+            f = io.BytesIO(data)
+            yield f
+            opened.append((stop_early, f.tell()))
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(live_data, "CHUNK_ROWS", 3):
+            for name, budget in [("partial", 2300), ("full", 10000)]:
+                cache = Path(tmp)/name
+                cache.mkdir()
+                output = io.BytesIO()
+                live_data.build_cache(cache, "producer", 11, budget, open_rows, output)
+                self.assertEqual(output.getvalue(), data)
+                chunks = json.loads((cache/"index.json").read_text())["chunks"]
+                self.assertLessEqual(sum(c[1] for c in chunks), budget)
+                opened.clear()
+                output = io.BytesIO()
+                live_data.replay_cache(cache, "producer", 11, budget, open_rows, output)
+                self.assertEqual(output.getvalue(), data)
+                if name == "full":
+                    self.assertEqual(opened, [])
+                else:
+                    self.assertGreater(chunks[0][0], 0)
+                    self.assertEqual(opened, [(True, 4+chunks[0][0]*live_data.ROW_BYTES)])
+                (cache/f"{chunks[-1][0]}.zlib").write_bytes(b"damaged")
+                with self.assertRaisesRegex(ValueError, "damaged"):
+                    live_data.replay_cache(cache, "producer", 11, budget, open_rows, io.BytesIO())
+
     def test_wsl_replay_without_repository_mount(self):
         # Stand in for wsl.exe by running the delivered script in an empty cwd.
         popen = subprocess.Popen
@@ -44,12 +78,13 @@ class LiveTrainingTest(unittest.TestCase):
             digest = hashlib.sha256(binary.read_bytes()).hexdigest()
             patch_sha = hashlib.sha256(Path(live.__file__).with_name("live_rows.patch").read_bytes()).hexdigest()
             (work/"build.json").write_text(json.dumps(dict(dataset="enwik9", producer=digest, patch=patch_sha)))
-            args = argparse.Namespace(wsl="Ubuntu", dataset="enwik9", work="/dataset", rows_file=None, run_dir=root)
+            args = argparse.Namespace(wsl="Ubuntu", dataset="enwik9", work="/dataset", rows_file=None, run_dir=root, cache_gib=16)
 
             def launch(cmd, **kwargs):
                 self.assertEqual(cmd[:8], ["wsl.exe", "-d", "Ubuntu", "--cd", "/", "--exec", "python3", "-"])
                 replay = cmd[8:]
                 self.assertEqual(replay[:2], ["replay", "/dataset"])
+                self.assertEqual(replay[replay.index("--cache-gib")+1], "16")
                 replay[1] = str(work)
                 return popen([sys.executable, "-", *replay], **dict(kwargs, cwd=root))
 
@@ -78,10 +113,12 @@ class LiveTrainingTest(unittest.TestCase):
             rows.write_bytes(fixture([12]*80)[1])
             args = argparse.Namespace(rows_file=rows, dataset="enwik9", run_dir=root/"control", device="cpu", threads=1,
                     seed=1, batch=4, context=8, window=4, buffer_windows=16, eval_windows=8,
-                    lr=2e-4, save_every=4, min_delta=100., patience=1, max_epochs=None, epochs=None)
+                    lr=2e-4, save_every=4, min_delta=100., patience=1, max_epochs=None, epochs=None,
+                    preset="compact", prefetch=False, cache_gib=0)
             args.run_dir.mkdir()
             live.fit(args)
             args.run_dir = root/"resume"
+            args.prefetch = True
             args.run_dir.mkdir()
             save = live.atomic_save
             def interrupt(state, path):

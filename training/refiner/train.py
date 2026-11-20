@@ -25,6 +25,7 @@ PRESETS = {
     # width, heads, FFN, shared blocks, high cycles, low cycles
     "smoke": (192, 3, 64, 1, 2, 1),
     "compact": (192, 3, 192, 1, 2, 1),
+    "compact-2x": (256, 4, 368, 1, 2, 1),
     "matched": (512, 8, 2298, 2, 2, 3),
 }
 

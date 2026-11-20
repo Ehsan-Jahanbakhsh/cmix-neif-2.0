@@ -46,6 +46,18 @@ One epoch visits the full stream once. About 5% of documents are assigned determ
 
 For a fixed training budget, pass `--epochs 20` to complete 20 total epochs across resumes. Validation and best-weight selection continue during a plateau.
 
+### Larger refiner with a reusable PPMd cache
+
+`--preset compact-2x` uses 603,360 parameters, width 256, four attention heads and feed-forward width 368. It keeps the compact model's shared block, recursion counts and 64-token default window. Start this architecture in a new run directory.
+
+```powershell
+.\build-refiner\gpu-env\Scripts\python.exe -u training/refiner/train_live.py --dataset enwik9 --work /home/hp/cmix-live-enwik9 --wsl Ubuntu --device cuda --preset compact-2x --batch 512 --cache-gib 16 --epochs 10 --run-dir build-refiner/live-enwik9-2x-b512
+```
+
+CPU preparation overlaps optimizer updates using two alternating buffers (one extra 26.25 MiB at the defaults). Use `--no-prefetch` for a timing comparison. On an RTX 4070 Laptop, the median GPU training times for the same 512 cached windows were 0.330 s with batch 128, 0.369 s with batch 256 and 0.371 s with batch 512. These timings exclude PPMd generation. Batch 512 makes one update per full buffer. Batch 128 makes four. Set the batch size before starting and use separate run directories when comparing them.
+
+`--cache-gib 16` allows up to 16 GiB of reusable Linux disk space in addition to native scratch. During the first complete pass, the producer sends every row to training and keeps the newest losslessly compressed chunks that fit in the budget. Later passes regenerate the prefix, stop the native producer at the boundary, and read the cached suffix. A cached row includes its token, target, document marker and all 208 original float16 probabilities. The trainer preserves the same document split and window order. The completed index is shared across checkpoints and model sizes using the same prepared dataset and producer. An interrupted build restarts on the next cache-enabled pass. `producer.log` reports how many rows fit. The default cache budget is zero.
+
 Repeating the same command resumes `state.pt`. The trainer checkpoints every 32 training buffers and after every epoch. On a mid-epoch restart it regenerates PPMd history from the beginning of that pass and skips completed optimizer updates. The native producer reports progress in `producer.log`; the metadata and PPMd warm-up come before the main training rows. The extra CPU work per epoch is the cost of avoiding the dense table. Upstream's published 712-epoch experiment uses a different window, shuffling, split, optimizer and quantization schedule. [Live training code](train_live.py) · [Row producer](live_data.py) · [Original training recipe](../README.md)
 
 ### enwik8 training

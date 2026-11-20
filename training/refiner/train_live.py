@@ -1,5 +1,6 @@
-"""Train the compact refiner on enwik8 or enwik9 until held-out Q4 loss plateaus."""
+"""Train a quantization-aware refiner on live or cached enwik8 or enwik9 rows."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 import json
@@ -8,6 +9,7 @@ import os
 from pathlib import Path, PurePosixPath
 import subprocess
 from tempfile import NamedTemporaryFile
+import time
 
 from filelock import FileLock
 import numpy as np
@@ -29,6 +31,8 @@ def source(args):
         return
     producer = Path(__file__).with_name("live_data.py").resolve()
     replay = ["replay", args.work, "--dataset", args.dataset]
+    if args.cache_gib:
+        replay.extend(["--cache-gib", str(args.cache_gib)])
     if args.wsl:
         # The Windows repo drive can disappear from WSL between epochs. Feed the
         # script over stdin and use only Linux paths for an absolute work directory.
@@ -164,7 +168,7 @@ def atomic_save(state, path):
 def fit(args):
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
-    dims = PRESETS["compact"]
+    dims = PRESETS[args.preset]
     model = make_model(dims, args.window, args.context).to(args.device)
     enable_q4(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -187,31 +191,45 @@ def fit(args):
     def save():
         atomic_save(dict(state, model=model.state_dict(), optimizer=optimizer.state_dict()), path)
 
-    buffer = np.empty((args.buffer_windows, args.context), ROW)
+    buffers = np.empty((2 if args.prefetch else 1, args.buffer_windows, args.context), ROW)
     panel = np.empty((args.eval_windows, args.context), ROW)
     limit = args.epochs if args.epochs is not None else args.max_epochs
     while limit is None or state["epoch"] < limit:
         if args.epochs is None and state["stale"] >= args.patience:
             break
         epoch = state["epoch"] + 1
+        epoch_start = time.monotonic()
         skip = state["buffers"]
         seen = filled = blocks = train_targets = fed = 0
         val_rng = np.random.default_rng(148)
         print(f"epoch {epoch}, replaying {args.dataset}, {skip} completed buffers to skip", flush=True)
 
-        def consume(n):
-            nonlocal blocks
-            blocks += 1
-            if blocks <= skip:
-                return
-            rng = np.random.default_rng([args.seed, epoch, blocks])
-            train_buffer(model, optimizer, buffer[:n], rng, args)
-            state["buffers"] = blocks
-            if blocks % args.save_every == 0:
+        def update(block, rows, targets):
+            rng = np.random.default_rng([args.seed, epoch, block])
+            train_buffer(model, optimizer, rows, rng, args)
+            state["buffers"] = block
+            if block % args.save_every == 0:
                 save()
-                print(f"epoch {epoch}, buffer {blocks}, {train_targets:,} scored training targets", flush=True)
+                print(f"epoch {epoch}, buffer {block}, {targets:,} scored training targets", flush=True)
 
-        with source(args) as stream:
+        # One optimizer worker at most. While it owns one buffer the reader fills
+        # the other. Join before reusing a buffer, validating, or releasing the run lock.
+        pending = None
+
+        def consume(n):
+            nonlocal blocks, buffer, pending
+            blocks += 1
+            if blocks > skip:
+                if pending is not None:
+                    pending.result()
+                if args.prefetch:
+                    pending = worker.submit(update, blocks, buffer[:n], train_targets)
+                else:
+                    update(blocks, buffer[:n], train_targets)
+            buffer = buffers[blocks % len(buffers)]
+
+        buffer = buffers[0]
+        with ThreadPoolExecutor(max_workers=1) as worker, source(args) as stream:
             for doc_id, doc in enumerate(documents(stream)):
                 fed += len(doc)
                 valid = held_out(doc_id)
@@ -229,8 +247,10 @@ def fit(args):
                         if filled == len(buffer):
                             consume(filled)
                             filled = 0
-        if filled:
-            consume(filled)
+            if filled:
+                consume(filled)
+            if pending is not None:
+                pending.result()
         if not train_targets or skip > blocks:
             raise ValueError("empty or shortened training stream")
         if not args.rows_file and args.dataset == "enwik8" and fed != 100_000_000:
@@ -261,7 +281,8 @@ def fit(args):
         progress = (f"target epoch {args.epochs}" if args.epochs is not None else
                     f"patience {state['stale']}/{args.patience}")
         print(f"epoch {epoch}: {loss:.6f} validation bits/byte on {n:,} targets, "
-              f"best epoch {state['best_epoch']}, {progress}", flush=True)
+              f"best epoch {state['best_epoch']}, {progress}, "
+              f"{(time.monotonic()-epoch_start)/60:.2f} minutes elapsed", flush=True)
     if state.get("best_weights"):
         model.load_state_dict(state["best_weights"])
         export(model, dims, args.window, args.run_dir/"best.rrb")
@@ -278,6 +299,10 @@ def main():
     p.add_argument("--wsl", help="WSL distribution when training with Windows PyTorch")
     p.add_argument("--run-dir", type=Path, required=True)
     p.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    p.add_argument("--preset", choices=("compact", "compact-2x"), default="compact")
+    p.add_argument("--prefetch", action=argparse.BooleanOptionalAction, default=True,
+                   help="prepare the next CPU buffer during the current optimizer updates")
+    p.add_argument("--cache-gib", type=int, default=0, help="maximum Linux disk space for reusable PPMd rows")
     p.add_argument("--context", type=int, default=128)
     p.add_argument("--window", type=int, default=64)
     p.add_argument("--batch", type=int, default=16)
@@ -293,6 +318,8 @@ def main():
     duration.add_argument("--max-epochs", type=int, help="total epoch limit with validation early stopping")
     duration.add_argument("--epochs", type=int, help="train to this total epoch count even if validation plateaus")
     args = p.parse_args()
+    if args.cache_gib < 0 or (args.rows_file and args.cache_gib):
+        p.error("--cache-gib requires a nonnegative budget and live --work input")
     if not (5 <= args.context <= 2048 and 1 <= args.window <= args.context):
         p.error("context must be 5..2048 and window must be 1..context")
     if min(args.batch, args.buffer_windows, args.eval_windows, args.save_every, args.patience, args.threads) < 1:
