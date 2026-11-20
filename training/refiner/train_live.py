@@ -189,7 +189,10 @@ def fit(args):
 
     buffer = np.empty((args.buffer_windows, args.context), ROW)
     panel = np.empty((args.eval_windows, args.context), ROW)
-    while state["stale"] < args.patience and (args.max_epochs is None or state["epoch"] < args.max_epochs):
+    limit = args.epochs if args.epochs is not None else args.max_epochs
+    while limit is None or state["epoch"] < limit:
+        if args.epochs is None and state["stale"] >= args.patience:
+            break
         epoch = state["epoch"] + 1
         skip = state["buffers"]
         seen = filled = blocks = train_targets = fed = 0
@@ -255,12 +258,14 @@ def fit(args):
         save()
         if state["best_epoch"] == epoch:
             export(model, dims, args.window, args.run_dir/"best.rrb")
+        progress = (f"target epoch {args.epochs}" if args.epochs is not None else
+                    f"patience {state['stale']}/{args.patience}")
         print(f"epoch {epoch}: {loss:.6f} validation bits/byte on {n:,} targets, "
-              f"best epoch {state['best_epoch']}, patience {state['stale']}/{args.patience}", flush=True)
+              f"best epoch {state['best_epoch']}, {progress}", flush=True)
     if state.get("best_weights"):
         model.load_state_dict(state["best_weights"])
         export(model, dims, args.window, args.run_dir/"best.rrb")
-    reason = "validation plateau" if state["stale"] >= args.patience else "epoch limit"
+    reason = "validation plateau" if args.epochs is None and state["stale"] >= args.patience else "epoch limit"
     print(json.dumps(dict(stopped=reason, best_epoch=state.get("best_epoch"), history=state["history"])), flush=True)
 
 
@@ -284,7 +289,9 @@ def main():
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--patience", type=int, default=3)
     p.add_argument("--min-delta", type=float, default=0.005, help="minimum validation improvement in bits/byte")
-    p.add_argument("--max-epochs", type=int, help="optional total epoch limit across resumes")
+    duration = p.add_mutually_exclusive_group()
+    duration.add_argument("--max-epochs", type=int, help="total epoch limit with validation early stopping")
+    duration.add_argument("--epochs", type=int, help="train to this total epoch count even if validation plateaus")
     args = p.parse_args()
     if not (5 <= args.context <= 2048 and 1 <= args.window <= args.context):
         p.error("context must be 5..2048 and window must be 1..context")
@@ -294,6 +301,8 @@ def main():
         p.error("invalid minimum improvement, learning rate or seed")
     if args.max_epochs is not None and args.max_epochs < 1:
         p.error("--max-epochs must be positive")
+    if args.epochs is not None and args.epochs < 1:
+        p.error("--epochs must be positive")
     if os.name == "nt" and args.work and not args.wsl:
         p.error("pass --wsl with the Ubuntu distribution name")
     args.run_dir.mkdir(parents=True, exist_ok=True)

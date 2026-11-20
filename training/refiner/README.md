@@ -44,6 +44,8 @@ python -u training/refiner/train_live.py --dataset enwik9 --work "$HOME/cmix-liv
 
 One epoch visits the full stream once. About 5% of documents are assigned deterministically to validation. The trainer samples up to 1,024 fixed validation windows across those documents and reports their target-weighted loss in bits per byte after each full pass. Training uses batch 16, 128-token crops, a 64-token sliding window, 512 locally shuffled windows per buffer, and quantization-aware training from the first update. The best export is `best.rrb`. The default stopping rule is three consecutive passes without a cumulative improvement of 0.005 validation bits per byte over the last qualifying score. `--patience` and `--min-delta` set this rule. `--max-epochs` optionally caps a run and prints when that cap caused the stop.
 
+For a fixed training budget, pass `--epochs 20` to complete 20 total epochs across resumes. Validation and best-weight selection continue during a plateau.
+
 Repeating the same command resumes `state.pt`. The trainer checkpoints every 32 training buffers and after every epoch. On a mid-epoch restart it regenerates PPMd history from the beginning of that pass and skips completed optimizer updates. The native producer reports progress in `producer.log`; the metadata and PPMd warm-up come before the main training rows. The extra CPU work per epoch is the cost of avoiding the dense table. Upstream's published 712-epoch experiment uses a different window, shuffling, split, optimizer and quantization schedule. [Live training code](train_live.py) · [Row producer](live_data.py) · [Original training recipe](../README.md)
 
 ### enwik8 training

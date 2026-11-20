@@ -78,7 +78,7 @@ class LiveTrainingTest(unittest.TestCase):
             rows.write_bytes(fixture([12]*80)[1])
             args = argparse.Namespace(rows_file=rows, dataset="enwik9", run_dir=root/"control", device="cpu", threads=1,
                     seed=1, batch=4, context=8, window=4, buffer_windows=16, eval_windows=8,
-                    lr=2e-4, save_every=4, min_delta=100., patience=1, max_epochs=None)
+                    lr=2e-4, save_every=4, min_delta=100., patience=1, max_epochs=None, epochs=None)
             args.run_dir.mkdir()
             live.fit(args)
             args.run_dir = root/"resume"
@@ -96,6 +96,12 @@ class LiveTrainingTest(unittest.TestCase):
             self.assertEqual(resumed["history"], control["history"])
             self.assertEqual(resumed["panel_sha"], control["panel_sha"])
             self.assertEqual((root/"control/best.rrb").read_bytes(), (root/"resume/best.rrb").read_bytes())
+            args.epochs = 3
+            live.fit(args)
+            extended = torch.load(root/"resume/state.pt", map_location="cpu", weights_only=True)
+            self.assertEqual(extended["epoch"], 3)
+            self.assertEqual(extended["history"][:-1], resumed["history"])
+            self.assertEqual(extended["panel_sha"], resumed["panel_sha"])
 
 
 if __name__ == "__main__":
