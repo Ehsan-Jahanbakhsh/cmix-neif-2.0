@@ -242,6 +242,8 @@ cmp enwik9 enwik9_uncompressed
 wc -c comp9 archive9
 ```
 
+To monitor an active encode from a second Linux or WSL terminal, run `watch -n 3 -x python3 "$repo/training/refiner/compression_status.py" /path/to/run-directory`, using the absolute repository path for `$repo`. It shows CPU time, thread count, and positions in open files. During main coding the input position in `archive9.cmix.temp` includes the encoder's read-ahead buffer.
+
 This build uses the included compact enwik9 pilot checkpoint. For the 9.3M demonstration checkpoint, set `REFINER_WEIGHTS="$repo/recursive-refiner.rrb"` on the build command. To embed your own checkpoint at build time, set `REFINER_WEIGHTS` to its absolute path. Once you have a packaged Q4 refiner executable, you can install another exported checkpoint in a **new** executable. This copies the compiled code, dictionary hints and article order, and updates the embedded weights and size trailer. The checkpoint specifies the window size, block count and cycle counts at load time.
 
 ```bash
