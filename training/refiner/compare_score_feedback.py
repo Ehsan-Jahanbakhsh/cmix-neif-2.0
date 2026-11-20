@@ -148,6 +148,10 @@ def main():
         done = [stats[n]["seconds"] >= args.seconds_per_model for n in names]
         if any(done) and "equal_updates" not in report["snapshots"]:
             snapshot("equal_updates")
+            matched = args.out/"equal-updates"
+            matched.mkdir()
+            for name, model in models.items():
+                export(model, dims, args.window, matched/f"{name}.rrb")
         if all(done):
             break
         if (turn+1) % 250 == 0:

@@ -88,10 +88,13 @@ def main():
             start = time.monotonic()
             subprocess.run([binary, "--sample-write", sample, payload], cwd=work, check=True)
             seconds = time.monotonic() - start
+            start = time.monotonic()
             subprocess.run([binary, "--sample-verify", sample, payload], cwd=work, check=True)
+            decode_seconds = time.monotonic() - start
             size = payload.stat().st_size
         print(f"{model}: {size} payload bytes, {8*size/length:.4f} bits/input byte, "
-              f"{seconds:.2f}s encode including startup, {checkpoint.stat().st_size} weight bytes, "
+              f"{seconds:.2f}s encode, {decode_seconds:.2f}s decode and verify including startup, "
+              f"{checkpoint.stat().st_size} weight bytes, "
               f"{length} decoded bytes verified", flush=True)
 
 

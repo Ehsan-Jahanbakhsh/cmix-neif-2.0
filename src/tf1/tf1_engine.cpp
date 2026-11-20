@@ -13,6 +13,9 @@
 #include <string.h>
 
 #include <cmath>
+#if defined(CMIX_SAMPLE) && defined(CMIX_REFINER)
+#include <chrono>
+#endif
 
 #ifdef __F16C__
 #include <immintrin.h>
@@ -254,6 +257,10 @@ struct Tf1Row {
 struct Tf1Engine::Impl {
 #ifdef CMIX_REFINER
   rr::Model* opt;
+#ifdef CMIX_SAMPLE
+  std::chrono::steady_clock::duration refiner_time;
+  unsigned long long refiner_calls;
+#endif
 #else
   fx2::opt::TransformerOpt* opt;
 #endif
@@ -329,7 +336,14 @@ struct Tf1Engine::Impl {
     float prior_f32[208];
     if ((gelesen && opt->uses_prior()) || opt->needs_prior_on_unread_rows())
       RowToFloats(prior, prior_f32);
+#ifdef CMIX_SAMPLE
+    const auto start = std::chrono::steady_clock::now();
+#endif
     opt->step(tok, out, gelesen, prior_f32);
+#ifdef CMIX_SAMPLE
+    refiner_time += std::chrono::steady_clock::now() - start;
+    ++refiner_calls;
+#endif
 #else
     if (opt) opt->set_gelesen(gelesen);
     fx2::PaketChannels ch;
@@ -424,6 +438,11 @@ LOAD_PATH_ATTR Tf1Engine::Tf1Engine(const std::vector<bool>& vocab, const char* 
 }
 
 LOAD_PATH_ATTR Tf1Engine::~Tf1Engine() {
+#if defined(CMIX_SAMPLE) && defined(CMIX_REFINER)
+  if (impl_->refiner_calls)
+    std::fprintf(stderr, "Refiner prediction time %.6f s over %llu rows\n",
+                 std::chrono::duration<double>(impl_->refiner_time).count(), impl_->refiner_calls);
+#endif
   // Loss report (off unless the constructor enables it).
   // Close the last article before the document-length check below.
   if (impl_->prompt) impl_->prompt->Finish();

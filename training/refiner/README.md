@@ -70,7 +70,7 @@ To compare from identical initial weights on cached enwik9 rows, run this from t
 .\build-refiner\gpu-env\Scripts\python.exe -u training/refiner/compare_score_feedback.py --cache '\\wsl.localhost\Ubuntu\home\hp\cmix-live-enwik9\refiner-row-cache-v1' --out build-refiner/score-feedback-comparison
 ```
 
-The output directory contains `results.json`, the held-out panel, both model snapshots and both Q4 exports. The score-feedback model uses the RRB3 format. To embed it, build from this source with `REFINER_WEIGHTS` pointing to the RRB3 export. The native predictor reads a prior on every fed row because even a row whose output is skipped can affect later predictions.
+The output directory contains `results.json`, the held-out panel, both model snapshots and their equal-time Q4 exports. The `equal-updates/` subdirectory holds Q4 exports taken after identical batches and optimizer steps. Use that pair to compare compression after equal training. The score-feedback model uses the RRB3 format. To embed it, build from this source with `REFINER_WEIGHTS` pointing to the RRB3 export. The native predictor reads a prior on every fed row because even a row whose output is skipped can affect later predictions.
 
 In a paired enwik9 experiment on an RTX 4070 Laptop, both compact-2x models started from seed 1 and used batch 128, a 64-token attention window and Q4-aware AdamW updates. Their validation panel contained 61,649 scored targets drawn from 32 held-out chunks. Another training job shared the GPU during the first part of the comparison. Loading cached windows and evaluating both models brought the elapsed time for the 30 minutes of optimizer updates to about 41 minutes.
 
@@ -84,6 +84,32 @@ In a paired enwik9 experiment on an RTX 4070 Laptop, both compact-2x models star
 | Q4 weight file | 354,944 bytes | 354,944 bytes |
 
 At equal time each model won 16 of the 32 held-out chunks. A paired bootstrap over chunks gave a 95% interval of −0.0047 to +0.0153 bits per scored byte for score feedback minus current. The CPU measurement used cached PPMd distributions and requested the next-byte probabilities on every input row. Archive size requires a separate compression run.
+
+#### Full-mixer compression after equal training
+
+Both 354,944-byte Q4 checkpoints had seen the same 63,711,305 scored targets in 8,242 updates. The original experiment retained the equal-time exports. Replaying the current refiner's original batches recovered its equal-update checkpoint and reproduced its recorded validation BPB of 2.5100976495.
+
+The sample was exactly 1,000,000 bytes beginning at offset 100,000,000 of the upstream enwik9 coder stream, with sample SHA-256 `df3de66e1d228f7f5b047cdb3474fddf4cc57477efd68e345f20a9daa918d345`. The same sample-mode C++ binary ran each model sequentially on one pinned WSL logical CPU of a Ryzen 7 8845HS. Encoding included startup, live PPMd, the bit mixer, arithmetic coding and the final flush. The output size is the arithmetic payload for the already preprocessed body excerpt.
+
+| Measurement | Current refiner | Score feedback |
+|---|---:|---:|
+| Compressed payload | 299,581 bytes | 298,538 bytes |
+| Bits per input byte | 2.396648 | 2.388304 |
+| End-to-end encode time | 438.05 s | 487.34 s |
+| Time inside the refiner during encoding | 251.07 s (57.3%) | 304.94 s (62.6%) |
+| Decode and verify all 1,000,000 bytes | 427.16 s | 474.26 s |
+
+Both payloads decoded byte-for-byte to the original sample. Score feedback saved 1,043 bytes (0.35%) and added 49.28 seconds to encoding and 47.10 seconds to decoding and verification.
+
+To reproduce the sample comparison with fresh equal-update exports, run these commands from the fork root in Ubuntu. Set `stream` to the upstream preprocessed file and `run` to the comparison output directory.
+
+```bash
+dd if="$stream" of="$run/body-1mb.bin" iflag=skip_bytes,count_bytes skip=100000000 count=1000000 status=none
+for name in current score-feedback; do
+  taskset -c 4 python3 training/refiner/benchmark.py build-refiner --model refiner \
+    --refiner-weights "$run/equal-updates/$name.rrb" --sample "$run/body-1mb.bin"
+done
+```
 
 ### enwik8 training
 
